@@ -1,0 +1,11 @@
+{
+    "file_format_version": "1.0.0",
+    "api_layer": {
+        "name": "XR_APILAYER_CPVR_probe",
+        "library_path": ".\\XR_APILAYER_CPVR_probe.dll",
+        "api_version": "1.0",
+        "implementation_version": "1",
+        "description": "Records the full OpenXR conversation: system properties, view configuration, swapchains, per-eye poses and FOV, and every submitted layer.",
+        "disable_environment": "XRPROBE_DISABLE"
+    }
+}

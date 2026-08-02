@@ -1,0 +1,7 @@
+# Packed game archives are binary. Git guesses this correctly today, but the guess is per-blob and
+# a WolvenKit repack could produce one it reads as text -- at which point CRLF conversion would
+# corrupt it silently on checkout, and the symptom would be a mod that simply does not load.
+*.archive   binary
+*.dtex      binary
+*.ent       binary
+*.dxil      binary

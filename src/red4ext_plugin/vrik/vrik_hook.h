@@ -157,6 +157,77 @@ extern volatile int       g_VRUseHeadRelative;   // 1 = compose hand pose relati
 extern volatile int       g_VRDiagCapture;       // 1 = snapshot bones 0..31 (pre-write) into g_VRDiagBones
 extern float              g_VRDiagBones[32 * 7];  // per bone: translation(3) + quaternion(4), in buffer space
 
+// SMOKE FINGER-HOLD (fingers-only "hold cigarette" grip). The buffer holds PARENT-LOCAL
+// transforms and VRIK never touches the finger bones (it owns arm + wrist only), so a
+// captured finger-local rotation, replayed each pass, curls the fingers relative to the
+// controller-driven wrist -- a native grip WITHOUT a full-body workspot. The curl is
+// captured live from the vanilla player hold-cigarette workspot (played once via AMM):
+// VRSmokeCaptureFingers() latches the current finger locals; SetVRSmokeFingers(1) then
+// replays them every pass. Right-hand deform finger + metacarpal bones only.
+extern volatile int       g_VRSmokeFingerActive;    // 1 = write captured finger locals every player pass
+extern volatile int       g_VRSmokeFingerCapture;   // 1 = capture request (latched on next player pass)
+extern volatile int       g_VRSmokeFingerHave;      // 1 once a pose has been captured
+extern volatile int       g_VRSmokeFingerCount;     // resolved right-hand finger bone count (0 = none)
+extern int                g_VRSmokeFingerIdx[32];   // resolved right-hand finger bone indices
+extern float              g_VRSmokeFingerRot[32][4];// captured parent-local rotation (x,y,z,w) per finger bone
+// Cigarette slot = WeaponRight bone: captured/applied with FULL local transform (+ live nudge).
+extern volatile int       g_VRSmokeCigIdx;
+extern volatile int       g_VRSmokeMouthBoneIdx;   // WeaponRight1 leaf (mouth pin), separate from grip
+extern volatile int       g_VRSmokeCigHave;
+extern volatile int       g_VRSmokeCigEnable;
+extern float              g_VRSmokeCigPos[3];
+extern float              g_VRSmokeCigRot[4];
+extern volatile float     g_VRSmokeCigOffP[3];
+extern volatile float     g_VRSmokeCigOffQ[4];
+// Model-space distance cig-slot(28) -> mouth (head bone + view offset), recomputed each body solve.
+// Same skeletal frame as the grip, so it tracks BOTH the HMD (head) and the controller (cig hand) --
+// unlike the redscript FPP camera, whose translation ignores HMD positional/lean tracking. 999 = n/a.
+extern volatile float     g_VRSmokeMouthDist;
+extern volatile float     g_VRSmokeMouthDistL;
+// Mouth anchor (hands-free): pin the cig to the head. See main.cpp for semantics.
+extern volatile int       g_VRSmokeMouthAnchor;
+extern volatile float     g_VRSmokeMouthPos[3];
+extern volatile float     g_VRSmokeMouthRot[4];
+extern volatile int       g_VRSmokeAnchorValid;
+extern volatile float     g_VRSmokeAnchorLocalPos[3];
+extern volatile float     g_VRSmokeAnchorLocalRot[4];
+// General mouth-pin (arbitrary bone): sel 0=off,1=Neck1,2=Head,3=Neck; resolved idx; alt local.
+extern volatile int       g_VRSmokeAnchorBoneSel;
+extern volatile int       g_VRSmokeAnchorBoneIdx;
+extern volatile int       g_VRSmokeAltAnchorValid;
+extern volatile float     g_VRSmokeAltAnchorLocalPos[3];
+extern volatile float     g_VRSmokeAltAnchorLocalRot[4];
+extern volatile float     g_VRSmokeCigScaleY;
+// Exhale smoke world pose (view pose composed with the smoke's own HMD-local offset).
+extern volatile float     g_VRSmokeSmokePos[3];
+extern volatile float     g_VRSmokeSmokeRot[4];
+extern volatile float     g_VRSmokeMouthWorldPos[3];
+extern volatile float     g_VRSmokeMouthWorldRot[4];
+extern volatile int       g_VRSmokeMouthWorldValid;
+// LEFT-HAND mirror (lighter): left fingers + WeaponLeft slot.
+extern volatile int       g_VRSmokeFingerActiveL;
+extern volatile int       g_VRSmokeFingerCaptureL;
+extern volatile int       g_VRSmokeFingerHaveL;
+extern volatile int       g_VRSmokeFingerCountL;
+extern int                g_VRSmokeFingerIdxL[32];
+extern float              g_VRSmokeFingerRotL[32][4];
+extern volatile int       g_VRSmokeLighterIdx;
+extern volatile int       g_VRSmokeLighterHave;
+extern volatile int       g_VRSmokeLighterEnable;
+extern float              g_VRSmokeLighterPos[3];
+extern float              g_VRSmokeLighterRot[4];
+extern volatile float     g_VRSmokeLighterOffP[3];
+extern volatile float     g_VRSmokeLighterOffQ[4];
+extern volatile float     g_VRSmokeThumbFlickL[4];
+extern volatile float     g_VRSmokeThumbPressManualL;
+extern int                g_VRSmokeThumbIsL[32];
+// LEFT-HAND cigarette grip (separate from the lighter); g_VRSmokeLeftUseCig selects it.
+extern volatile int       g_VRSmokeLeftUseCig;
+extern volatile int       g_VRSmokeCigLHave;
+extern float              g_VRSmokeFingerRotLC[32][4];
+extern float              g_VRSmokeCigLPos[3];
+extern float              g_VRSmokeCigLRot[4];
+
 extern volatile float     g_VRPlayerYaw;          // player world yaw (degrees), pushed from Lua each frame
 extern volatile float     g_VRCamI, g_VRCamJ, g_VRCamK, g_VRCamR; // FPP camera (HMD) world quaternion
 // FPP camera (HMD) + player entity world position (pushed from Lua) -> used to place the IK
@@ -184,7 +255,7 @@ extern volatile int       g_VRCamPairValid;
 // seqlock [143], so BOTH arms and the view-pos resolver consume ONE render frame.
 // Mixing a latched vq (previous frame) with a directly-read fresh yaw produced the
 // snap-turn arm double; per-arm direct reads produced the left-only head-turn ghost.
-inline float g_viewPkt[9] = { 0,0,0,1, 0,0,0, 0, 0 };   // [0..3]=vq, [4..6]=delta, [7]=flag111, [8]=yaw141
+inline float g_viewPkt[17] = { 0,0,0,1, 0,0,0, 0, 0, 0, 0,0,0, 0,0,0,1 }; // +[13..16]=head ori the view was built with
 inline bool  g_viewPktValid = false;
 
 // Shared snap-window trace writer (bin\x64\cyberpunkvr_snapwin.log). Used by the
@@ -217,15 +288,21 @@ inline void VRIK_LatchViewPacket() {
         const uint32_t s0 = *seq;
         if (s0 == 0u) return;                    // writer absent (older dxgi)
         if (s0 & 1u) continue;                   // write in progress
-        float tmp[9];
+        float tmp[17];
         tmp[0] = g_pSharedHands[104]; tmp[1] = g_pSharedHands[105];
         tmp[2] = g_pSharedHands[106]; tmp[3] = g_pSharedHands[107];
         tmp[4] = g_pSharedHands[108]; tmp[5] = g_pSharedHands[109];
         tmp[6] = g_pSharedHands[110]; tmp[7] = g_pSharedHands[111];
         tmp[8] = g_pSharedHands[141];
+        tmp[9]  = g_pSharedHands[68];          // publish stamp, for the age census
+        tmp[10] = g_pSharedHands[218];         // the position the frame renders from
+        tmp[11] = g_pSharedHands[219];
+        tmp[12] = g_pSharedHands[220];
+        tmp[13] = g_pSharedHands[227]; tmp[14] = g_pSharedHands[228];
+        tmp[15] = g_pSharedHands[229]; tmp[16] = g_pSharedHands[230];
         const float ok142 = g_pSharedHands[142];
         if (*seq == s0) {
-            for (int k = 0; k < 9; ++k) g_viewPkt[k] = tmp[k];
+            for (int k = 0; k < 17; ++k) g_viewPkt[k] = tmp[k];
             g_viewPktValid = (ok142 == 1.0f);
             // SNAP EVENT SYNC (trace-driven; replaces both entity/camera comparators --
             // snap_trace PROVED the puppet yaw sits up to ~10deg off the heading
@@ -327,11 +404,16 @@ inline bool VRIK_ResolveViewPos(float out[3]) {
     const float flag = g_viewPktValid ? g_viewPkt[7] : SharedPose(111);
     if (flag == 0.0f) return false;
     if (!g_VRCamPosValid) return false;
+    // Prefer the delta dxgi built from the SAME head sample as the hand offsets ([112..114],
+    // inside the hands seqlock). The render packet's delta is a different, older sample: measured
+    // 33 ms against the hands' 21 ms, and a hand reconstructed from two different instants lands
+    // in the wrong world place by the head motion between them. Falls back to the packet when
+    // dxgi does not publish it (older build, or the switch is off).
+    const bool coherent = (SharedPose(115) == 1.0f);
     const float v[3] = {
-        g_viewPktValid ? g_viewPkt[4] : SharedPose(108),
-        g_viewPktValid ? g_viewPkt[5] : SharedPose(109),
-        g_viewPktValid ? g_viewPkt[6] : SharedPose(110) };
-    if (flag == 2.0f) {
+        coherent ? SharedPose(112) : (g_viewPktValid ? g_viewPkt[4] : SharedPose(108)),
+        coherent ? SharedPose(113) : (g_viewPktValid ? g_viewPkt[5] : SharedPose(109)),
+        coherent ? SharedPose(114) : (g_viewPktValid ? g_viewPkt[6] : SharedPose(110)) };    if (flag == 2.0f) {
         // v2: v = float-exact translation DELTA (head + sliders + bakes; slow values)
         // added onto the COHERENT camera = entity + same-push (cam - entity). Both parts
         // of the pair come from ONE Lua push, so entity_N + local_N == cam_N exactly --
@@ -400,13 +482,20 @@ extern volatile int       g_VRIKSolvesMaxTick;    // max solves per tick since e
 extern volatile uintptr_t g_VRIKLastBufA;         // distinct bone buffers seen within one tick
 extern volatile uintptr_t g_VRIKLastBufB;
 extern volatile int       g_VRIKReplayTotal;      // same-tick replays served from the solve cache
+extern volatile int       g_VRIKFreshTotal;       // solves that actually recomputed the pose
+// 1 = rotate the controller offset by the head orientation from ITS OWN sample instead of the
+// view packet's. Live switch so the two can be compared by feel, not by argument.
+extern volatile int       CyberpunkVR_VrikHandFrameAlign;
 // Clavicle-aim diag [side][8]: desired joint (0..2), FK joint after aim (3..5),
 // aim angle needed (6, deg), applied after cap (7, deg). side 0=R, 1=L.
 extern volatile float     g_VRIKDbgClav[2][8];
 extern volatile float     g_VRIKDbgChestTgt[3];
 
 // Full-arm IK (g_VRBind == 4): hierarchy + chain indices resolved in VRIK_DoArmPlayer.
-extern int16_t            g_VRBoneParent[256];     // metaRig parent index per bone
+// 800, not 256: the smoking gesture resolves finger bones by name across the WHOLE metaRig, and
+// the player rig runs past 256 entries. Grown alongside the definition in main.cpp -- the two must
+// agree or the linker reports "redefinition; different subscripts".
+extern int16_t            g_VRBoneParent[800];     // metaRig parent index per bone
 extern volatile int       g_VRBoneCount;           // bone count (0 = not resolved)
 extern volatile int       g_VRFKCount;             // solver-touched bone prefix (0 = full count)
 extern volatile int       g_VRRightUpperArmIdx;    // RightArm  (shoulder joint / upper-arm start)
@@ -572,7 +661,7 @@ static constexpr int VRIK_TRANS_OFF = 0;   // Translation (Vector4)
 static constexpr int VRIK_ROT_OFF   = 16;  // Rotation (Quaternion x,y,z,w)
 
 // Model-space FK scratch (recomputed each matched frame). Sized generously.
-static constexpr int VRIK_MAX_BONES = 256;
+static constexpr int VRIK_MAX_BONES = 800;  // was 256; raised so custom rig bones (WeaponRight1 ~767) fit
 static float g_fkPos[VRIK_MAX_BONES][3];
 static float g_fkRot[VRIK_MAX_BONES][4];
 
@@ -850,7 +939,6 @@ static inline void VRIK_SolveArm(uint8_t* boneBuf, int upperIdx, int foreIdx, in
         upLen   = (calibHalf > 0.0f) ? calibHalf : s_restUpLen[sideJ];
         foreLen = (calibHalf > 0.0f) ? calibHalf : s_restForeLen[sideJ];
     }
-
     // SHOULDER PROTRACTION (VRArmIK ShoulderPoser-lite). Reaching far FORWARD a real
     // shoulder slides several cm forward (scapula protracts); the avatar's fixed shoulder
     // made forward reaches land ~5cm short, so the hand pin stretched the forearm
@@ -1991,6 +2079,9 @@ static inline void VRIK_PlaceBodyUnderHMD(uint8_t* boneBuf,
             g_pSharedHands[118] = s_eyeViewEMA[2];
             g_pSharedHands[119] = 1.0f;
         }
+        // NOTE: cig->mouth distance is NOT computed here. g_fkPos at this stage is still the ENGINE
+        // IDLE pose (wrist ~hip); the hand only reaches the controller after the arm IK below. The
+        // mouth distance is computed post-solve from the controller target -- see g_VRSmokeMouthDist.
     }
 
     g_VRIKDbgChest[0]=g_fkPos[headIdx][0]; g_VRIKDbgChest[1]=g_fkPos[headIdx][1]; g_VRIKDbgChest[2]=g_fkPos[headIdx][2];
@@ -2029,7 +2120,9 @@ extern "C" inline void* Hooked_AnimPoseApply(void* a1, void* a2, void* a3, unsig
     // No VirtualQuery here -- that syscall per call was the FPS killer. a2 is always
     // a valid pose-apply argument, so a single __try guards the dereferences.
     if (!(g_PlayerTrackBufA || g_PlayerTrackBufB)) return result;
-    if (g_VRBind <= 0 && g_AnimPoseDebug == 0 && g_VRDiagCapture == 0) return result;
+    if (g_VRBind <= 0 && g_AnimPoseDebug == 0 && g_VRDiagCapture == 0 &&
+        g_VRSmokeFingerActive == 0 && g_VRSmokeFingerCapture == 0 &&
+        g_VRSmokeFingerActiveL == 0 && g_VRSmokeFingerCaptureL == 0) return result;
 
     __try {
         void* poseDesc = reinterpret_cast<void**>(a2)[7];
@@ -2046,6 +2139,164 @@ extern "C" inline void* Hooked_AnimPoseApply(void* a1, void* a2, void* a3, unsig
                 // player apply (this runs on the animation thread; dxgi writes on the
                 // present thread).
                 RefreshHandsSnapshot();
+
+                // SMOKE FINGER-HOLD (fingers-only grip). Runs on EVERY player pass, BEFORE
+                // the solve/replay split, so the curl is bit-identical across the 4-5
+                // passes/tick -> no finger flicker. The original ran at the top of this
+                // hook, so boneBuf's finger locals here are the game's current anim pose:
+                //   * CAPTURE reads them (while the AMM hold-cigarette workspot plays -> the
+                //     authored curl) and latches them; it takes priority so it never records
+                //     our own replayed pose.
+                //   * APPLY writes the latched locals back. Finger bones are parent-local and
+                //     untouched by VRIK, so they curl relative to the controller-driven wrist.
+                if (g_VRSmokeFingerCount > 0 || g_VRSmokeCigIdx >= 0) {
+                    if (g_VRSmokeFingerCapture) {
+                        // Fingers: rotation only (parent-local; no translation => no skin stretch).
+                        for (int k = 0; k < g_VRSmokeFingerCount && k < 32; ++k) {
+                            const int bi = g_VRSmokeFingerIdx[k];
+                            if (bi < 0 || bi >= VRIK_MAX_BONES) continue;
+                            const float* q = reinterpret_cast<float*>(boneBuf + bi * 48 + VRIK_ROT_OFF);
+                            g_VRSmokeFingerRot[k][0] = q[0]; g_VRSmokeFingerRot[k][1] = q[1];
+                            g_VRSmokeFingerRot[k][2] = q[2]; g_VRSmokeFingerRot[k][3] = q[3];
+                        }
+                        if (g_VRSmokeFingerCount > 0) g_VRSmokeFingerHave = 1;
+                        // Cig slot (WeaponRight): full local transform T + R.
+                        if (g_VRSmokeCigIdx >= 0 && g_VRSmokeCigIdx < VRIK_MAX_BONES) {
+                            const float* t = reinterpret_cast<float*>(boneBuf + g_VRSmokeCigIdx * 48 + VRIK_TRANS_OFF);
+                            const float* q = reinterpret_cast<float*>(boneBuf + g_VRSmokeCigIdx * 48 + VRIK_ROT_OFF);
+                            g_VRSmokeCigPos[0]=t[0]; g_VRSmokeCigPos[1]=t[1]; g_VRSmokeCigPos[2]=t[2];
+                            g_VRSmokeCigRot[0]=q[0]; g_VRSmokeCigRot[1]=q[1]; g_VRSmokeCigRot[2]=q[2]; g_VRSmokeCigRot[3]=q[3];
+                            g_VRSmokeCigHave = 1;
+                        }
+                        g_VRSmokeFingerCapture = 0;
+                    } else if (g_VRSmokeFingerActive) {
+                        if (g_VRSmokeFingerHave) {
+                            for (int k = 0; k < g_VRSmokeFingerCount && k < 32; ++k) {
+                                const int bi = g_VRSmokeFingerIdx[k];
+                                if (bi < 0 || bi >= VRIK_MAX_BONES) continue;
+                                float* q = reinterpret_cast<float*>(boneBuf + bi * 48 + VRIK_ROT_OFF);
+                                q[0] = g_VRSmokeFingerRot[k][0]; q[1] = g_VRSmokeFingerRot[k][1];
+                                q[2] = g_VRSmokeFingerRot[k][2]; q[3] = g_VRSmokeFingerRot[k][3];
+                            }
+                        }
+                        // Place the cig slot. Runs EVERY pass (before the solve/replay split), so
+                        // whatever we write here survives all 4-5 replays. When the mouth anchor is
+                        // active AND the fresh arm solve has produced a head-anchored local, replay
+                        // that local (cig stays at the lips even on replay passes / hand lowered);
+                        // otherwise the captured grip local + live nudge (cig in the hand).
+                        // GRIP (cig in the RIGHT hand): pose WeaponRight with the captured grip local +
+                        // nudge -- ONLY when NOT mouth-anchored.
+                        if (g_VRSmokeCigEnable && g_VRSmokeCigHave && !(g_VRSmokeMouthAnchor && g_VRSmokeAnchorValid)
+                            && g_VRSmokeCigIdx >= 0 && g_VRSmokeCigIdx < VRIK_MAX_BONES) {
+                            float* t = reinterpret_cast<float*>(boneBuf + g_VRSmokeCigIdx * 48 + VRIK_TRANS_OFF);
+                            float* q = reinterpret_cast<float*>(boneBuf + g_VRSmokeCigIdx * 48 + VRIK_ROT_OFF);
+                            t[0] = g_VRSmokeCigPos[0] + g_VRSmokeCigOffP[0];
+                            t[1] = g_VRSmokeCigPos[1] + g_VRSmokeCigOffP[1];
+                            t[2] = g_VRSmokeCigPos[2] + g_VRSmokeCigOffP[2];
+                            const float base[4] = { g_VRSmokeCigRot[0], g_VRSmokeCigRot[1], g_VRSmokeCigRot[2], g_VRSmokeCigRot[3] };
+                            const float off[4]  = { g_VRSmokeCigOffQ[0], g_VRSmokeCigOffQ[1], g_VRSmokeCigOffQ[2], g_VRSmokeCigOffQ[3] };
+                            float out[4]; VRIK_QuatMul(base, off, out); VRIK_QuatNorm(out);
+                            q[0]=out[0]; q[1]=out[1]; q[2]=out[2]; q[3]=out[3];
+                            float* s = reinterpret_cast<float*>(boneBuf + g_VRSmokeCigIdx * 48 + 32);
+                            s[0] = 1.0f; s[1] = g_VRSmokeCigScaleY; s[2] = 1.0f;
+                        }
+                        // MOUTH PIN: pin WeaponRight1 (a separate LEAF) to the lips when anchored, so
+                        // WeaponRight stays free for a weapon and only the cig moves (body/head untouched).
+                        if (g_VRSmokeMouthAnchor && g_VRSmokeAnchorValid
+                            && g_VRSmokeMouthBoneIdx >= 0 && g_VRSmokeMouthBoneIdx < VRIK_MAX_BONES) {
+                            float* t = reinterpret_cast<float*>(boneBuf + g_VRSmokeMouthBoneIdx * 48 + VRIK_TRANS_OFF);
+                            float* q = reinterpret_cast<float*>(boneBuf + g_VRSmokeMouthBoneIdx * 48 + VRIK_ROT_OFF);
+                            t[0]=g_VRSmokeAnchorLocalPos[0]; t[1]=g_VRSmokeAnchorLocalPos[1]; t[2]=g_VRSmokeAnchorLocalPos[2];
+                            q[0]=g_VRSmokeAnchorLocalRot[0]; q[1]=g_VRSmokeAnchorLocalRot[1]; q[2]=g_VRSmokeAnchorLocalRot[2]; q[3]=g_VRSmokeAnchorLocalRot[3];
+                            float* s = reinterpret_cast<float*>(boneBuf + g_VRSmokeMouthBoneIdx * 48 + 32);
+                            s[0] = 1.0f; s[1] = g_VRSmokeCigScaleY; s[2] = 1.0f;
+                        }
+                    }
+                }
+                // LEFT HAND mirror (lighter grip): left fingers + WeaponLeft slot.
+                if (g_VRSmokeFingerCountL > 0 || g_VRSmokeLighterIdx >= 0) {
+                    if (g_VRSmokeFingerCaptureL) {
+                        const bool capCig = (g_VRSmokeLeftUseCig != 0);   // capture into the cig-left buffer?
+                        for (int k = 0; k < g_VRSmokeFingerCountL && k < 32; ++k) {
+                            const int bi = g_VRSmokeFingerIdxL[k];
+                            if (bi < 0 || bi >= VRIK_MAX_BONES) continue;
+                            const float* q = reinterpret_cast<float*>(boneBuf + bi * 48 + VRIK_ROT_OFF);
+                            float* dst = capCig ? g_VRSmokeFingerRotLC[k] : g_VRSmokeFingerRotL[k];
+                            dst[0] = q[0]; dst[1] = q[1]; dst[2] = q[2]; dst[3] = q[3];
+                        }
+                        if (g_VRSmokeFingerCountL > 0) { if (capCig) g_VRSmokeCigLHave = 1; else g_VRSmokeFingerHaveL = 1; }
+                        if (g_VRSmokeLighterIdx >= 0 && g_VRSmokeLighterIdx < VRIK_MAX_BONES) {
+                            const float* t = reinterpret_cast<float*>(boneBuf + g_VRSmokeLighterIdx * 48 + VRIK_TRANS_OFF);
+                            const float* q = reinterpret_cast<float*>(boneBuf + g_VRSmokeLighterIdx * 48 + VRIK_ROT_OFF);
+                            if (capCig) {
+                                g_VRSmokeCigLPos[0]=t[0]; g_VRSmokeCigLPos[1]=t[1]; g_VRSmokeCigLPos[2]=t[2];
+                                g_VRSmokeCigLRot[0]=q[0]; g_VRSmokeCigLRot[1]=q[1]; g_VRSmokeCigLRot[2]=q[2]; g_VRSmokeCigLRot[3]=q[3];
+                                g_VRSmokeCigLHave = 1;
+                            } else {
+                                g_VRSmokeLighterPos[0]=t[0]; g_VRSmokeLighterPos[1]=t[1]; g_VRSmokeLighterPos[2]=t[2];
+                                g_VRSmokeLighterRot[0]=q[0]; g_VRSmokeLighterRot[1]=q[1]; g_VRSmokeLighterRot[2]=q[2]; g_VRSmokeLighterRot[3]=q[3];
+                                g_VRSmokeLighterHave = 1;
+                            }
+                        }
+                        g_VRSmokeFingerCaptureL = 0;
+                    } else if (g_VRSmokeFingerActiveL) {
+                        const bool useCig = (g_VRSmokeLeftUseCig != 0);      // left hand holds the cig, not the lighter
+                        const bool haveFing = useCig ? (g_VRSmokeCigLHave != 0) : (g_VRSmokeFingerHaveL != 0);
+                        if (haveFing) {
+                            // Thumb press amount: the left VR trigger, analog, or the manual override
+                            // (tuning). nlerp identity->flick by that amount, composed onto the thumb
+                            // bones' rest rotation. The lighter-wheel flick is meaningless for the
+                            // cig, so it is suppressed when useCig.
+                            //
+                            // The slot moved. This used to read [67], which now carries the
+                            // hand-sample millisecond stamp -- a number the clamp below turns into a
+                            // permanent 1.0, so the thumb sat fully flicked and never answered the
+                            // trigger at all. Same reassignment that had the lighter igniting by
+                            // itself; this was the last reader left on the old number.
+                            float press = g_pSharedHands
+                                        ? g_pSharedHands[vrshared::kLeftTriggerAnalog] : 0.0f;
+                            if (g_VRSmokeThumbPressManualL > press) press = g_VRSmokeThumbPressManualL;
+                            if (press < 0.0f) press = 0.0f; else if (press > 1.0f) press = 1.0f;
+                            float fq[4] = { g_VRSmokeThumbFlickL[0]*press,
+                                            g_VRSmokeThumbFlickL[1]*press,
+                                            g_VRSmokeThumbFlickL[2]*press,
+                                            g_VRSmokeThumbFlickL[3]*press + (1.0f - press) };
+                            VRIK_QuatNorm(fq);
+                            const bool pressing = !useCig && press > 0.0001f;
+                            for (int k = 0; k < g_VRSmokeFingerCountL && k < 32; ++k) {
+                                const int bi = g_VRSmokeFingerIdxL[k];
+                                if (bi < 0 || bi >= VRIK_MAX_BONES) continue;
+                                const float* rot = useCig ? g_VRSmokeFingerRotLC[k] : g_VRSmokeFingerRotL[k];
+                                float* q = reinterpret_cast<float*>(boneBuf + bi * 48 + VRIK_ROT_OFF);
+                                if (pressing && g_VRSmokeThumbIsL[k]) {
+                                    float out[4]; VRIK_QuatMul(rot, fq, out); VRIK_QuatNorm(out);
+                                    q[0]=out[0]; q[1]=out[1]; q[2]=out[2]; q[3]=out[3];
+                                } else {
+                                    q[0] = rot[0]; q[1] = rot[1]; q[2] = rot[2]; q[3] = rot[3];
+                                }
+                            }
+                        }
+                        const bool slotApply = useCig ? (g_VRSmokeCigLHave != 0)
+                                                      : (g_VRSmokeLighterEnable && g_VRSmokeLighterHave);
+                        if (slotApply && g_VRSmokeLighterIdx >= 0 && g_VRSmokeLighterIdx < VRIK_MAX_BONES) {
+                            float* t = reinterpret_cast<float*>(boneBuf + g_VRSmokeLighterIdx * 48 + VRIK_TRANS_OFF);
+                            float* q = reinterpret_cast<float*>(boneBuf + g_VRSmokeLighterIdx * 48 + VRIK_ROT_OFF);
+                            if (useCig) {
+                                t[0] = g_VRSmokeCigLPos[0]; t[1] = g_VRSmokeCigLPos[1]; t[2] = g_VRSmokeCigLPos[2];
+                                q[0]=g_VRSmokeCigLRot[0]; q[1]=g_VRSmokeCigLRot[1]; q[2]=g_VRSmokeCigLRot[2]; q[3]=g_VRSmokeCigLRot[3];
+                                VRIK_QuatNorm(q);
+                            } else {
+                                t[0] = g_VRSmokeLighterPos[0] + g_VRSmokeLighterOffP[0];
+                                t[1] = g_VRSmokeLighterPos[1] + g_VRSmokeLighterOffP[1];
+                                t[2] = g_VRSmokeLighterPos[2] + g_VRSmokeLighterOffP[2];
+                                const float base[4] = { g_VRSmokeLighterRot[0], g_VRSmokeLighterRot[1], g_VRSmokeLighterRot[2], g_VRSmokeLighterRot[3] };
+                                const float off[4]  = { g_VRSmokeLighterOffQ[0], g_VRSmokeLighterOffQ[1], g_VRSmokeLighterOffQ[2], g_VRSmokeLighterOffQ[3] };
+                                float out[4]; VRIK_QuatMul(base, off, out); VRIK_QuatNorm(out);
+                                q[0]=out[0]; q[1]=out[1]; q[2]=out[2]; q[3]=out[3];
+                            }
+                        }
+                    }
+                }
 
                 // Diagnostic snapshot of the ORIGINAL (pre-write) pose of bones 0..31.
                 // Correct QsTransform layout: translation@+0, rotation@+16.
@@ -2235,6 +2486,17 @@ extern "C" inline void* Hooked_AnimPoseApply(void* a1, void* a2, void* a3, unsig
                         }
                         ++s_count;
                     }
+                    // Rates out to shared memory, for the dxgi side to log against its own
+                    // present count. "VRIK looks like 10 fps while the game is 60" is a claim
+                    // about a RATE, and the three that matter are here: how often the engine
+                    // applies the player pose, how often we recompute it, and how often we just
+                    // replay the previous one. Three float stores on a path that already touches
+                    // this block.
+                    if (g_pSharedHands) {
+                        g_pSharedHands[208] = static_cast<float>(g_AnimPoseMatchCalls);
+                        g_pSharedHands[209] = static_cast<float>(g_VRIKFreshTotal);
+                        g_pSharedHands[210] = static_cast<float>(g_VRIKReplayTotal);
+                    }
                     // ONE SOLVE PER TICK + BIT-EXACT REPLAY. Measured: the engine applies
                     // the player pose 4-5x per tick (solvesPerTick max=5, same buffer).
                     // Every engine pass re-evaluates the graph from ITS OWN inputs --
@@ -2269,6 +2531,73 @@ extern "C" inline void* Hooked_AnimPoseApply(void* a1, void* a2, void* a3, unsig
                         }
                         ++g_VRIKReplayTotal;
                     } else {
+                    ++g_VRIKFreshTotal;
+                    // POSE AGE AT SOLVE TIME. Same process, so QPC differences are directly
+                    // meaningful; [67] carries the stamp of the XR sample this snapshot came
+                    // from. Published as a running sum (mean = delta-sum / delta-solves) plus a
+                    // peak the reader clears, because the peak is what a head turn feels like.
+                    {
+                        LARGE_INTEGER c{}, f{};
+                        QueryPerformanceCounter(&c);
+                        QueryPerformanceFrequency(&f);
+                        const double nowMs = (f.QuadPart > 0)
+                            ? (double)c.QuadPart * 1000.0 / (double)f.QuadPart : 0.0;
+                        float age = (float)(fmod(nowMs, 100000.0) - (double)SharedPose(67));
+                        if (age < 0.0f) age += 100000.0f;      // stamp wrapped
+                        if (age >= 0.0f && age < 2000.0f) {
+                            g_pSharedHands[211] += age;
+                            if (age > g_pSharedHands[213]) g_pSharedHands[213] = age;
+                        }
+                        static uint32_t s_lastHandSeq = 0xFFFFFFFFu;
+                        if (g_handsStableSeq != s_lastHandSeq) {
+                            s_lastHandSeq = g_handsStableSeq;
+                            g_pSharedHands[214] += 1.0f;       // distinct publishes consumed
+                        }
+                        // Age of the ANCHOR -- the render-view pose the arms hang off. The hand
+                        // offset is built to be head-rotation independent, so what is left to
+                        // shake the arms is this: the anchor is a view from an earlier moment
+                        // than the camera the frame is drawn with.
+                        if (g_viewPktValid && g_viewPkt[9] != 0.0f) {
+                            float va = (float)(fmod(nowMs, 100000.0) - (double)g_viewPkt[9]);
+                            if (va < 0.0f) va += 100000.0f;
+                            if (va >= 0.0f && va < 2000.0f) {
+                                g_pSharedHands[215] += va;
+                                if (va > g_pSharedHands[216]) g_pSharedHands[216] = va;
+                            }
+                        }
+                        // THE GAP. What the arms hang off versus what the frame is drawn
+                        // from, in millimetres. Both come from the same latched packet, so this
+                        // is not a timing artefact of the census -- any distance here is a real
+                        // per-frame displacement of the hands relative to the view.
+                        if (g_viewPktValid && (g_viewPkt[10] != 0.0f || g_viewPkt[11] != 0.0f)) {
+                            float anchor[3];
+                            if (VRIK_ResolveViewPos(anchor)) {
+                                const float ex = anchor[0] - g_viewPkt[10];
+                                const float ey = anchor[1] - g_viewPkt[11];
+                                const float ez = anchor[2] - g_viewPkt[12];
+                                const float mm = std::sqrt(ex*ex + ey*ey + ez*ez) * 1000.0f;
+                                if (mm < 5000.0f) {
+                                    g_pSharedHands[221] += mm;
+                                    if (mm > g_pSharedHands[222]) g_pSharedHands[222] = mm;
+                                }
+                            }
+                            if (SharedPose(115) == 1.0f) g_pSharedHands[223] += 1.0f;
+                        }
+                        // How far the head turned since the previous solve. Multiplied by the
+                        // anchor age in frames and the ~0.1 m neck lever, this is the millimetres
+                        // the hands are displaced by -- the quantity actually being felt.
+                        {
+                            static float s_prevQ[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                            const float q0 = SharedPose(16), q1 = SharedPose(17),
+                                        q2 = SharedPose(18), q3 = SharedPose(19);
+                            float d = q0*s_prevQ[0] + q1*s_prevQ[1] + q2*s_prevQ[2] + q3*s_prevQ[3];
+                            if (d < 0.0f) d = -d;
+                            if (d > 1.0f) d = 1.0f;
+                            const float degs = 2.0f * std::acos(d) * 57.29578f;
+                            if (degs < 45.0f && degs > g_pSharedHands[217]) g_pSharedHands[217] = degs;
+                            s_prevQ[0]=q0; s_prevQ[1]=q1; s_prevQ[2]=q2; s_prevQ[3]=q3;
+                        }
+                    }
                     // Latch the render view packet ONCE for this solve: both arms and
                     // the view-pos resolver consume the SAME frame.
                     VRIK_LatchViewPacket();
@@ -2714,6 +3043,9 @@ extern "C" inline void* Hooked_AnimPoseApply(void* a1, void* a2, void* a3, unsig
                             // camModelRot * mapped(controller HMD-local). If a head-pitch/turn
                             // inversion shows, the fix is in the FRAME COMPOSITION (independent
                             // research running), not a return to shoulder-relative targets.
+                            // View (HMD) pose in model space, captured from the gizmo path below so the
+                            // mouth anchor (after the solve) can ride the real head, not the idle head bone.
+                            float vrViewPosM[3] = {0.0f,0.0f,0.0f}; float vrViewRotM[4] = {0.0f,0.0f,0.0f,1.0f}; bool vrViewFrameOk = false;
                             if (camModelValid) {
                                 // Anchor at the BODY camera (baked+smoothed camModelPos -- the same
                                 // camera the body/shoulders hang from), NOT the raw camera: the raw
@@ -2746,15 +3078,53 @@ extern "C" inline void* Hooked_AnimPoseApply(void* a1, void* a2, void* a3, unsig
                                     // vq via the hands snapshot -- THE path that was trail-free
                                     // in user testing (reverted to it by user order; the packet
                                     // source trailed the rendered view by one sample).
+                                    // ONE LATCH FOR THE WHOLE FRAME OF REFERENCE. vq used to be
+                                    // read from the hands snapshot while the heading and the head
+                                    // orientation beside it came from the view packet -- two
+                                    // seqlocks, two instants. The comment below still claims they
+                                    // are the same packet; they were not. With the camera doing
+                                    // its idle sway the two drift apart, and the difference lands
+                                    // straight on the hand's ROTATION: measured 0.44 deg per frame
+                                    // with the controllers lying on the table.
+                                    //
+                                    // Taking vq from the packet was tried before and left a trail,
+                                    // because the packet lags the rendered view by a sample. That
+                                    // objection is gone: the alignment below replaces the packet's
+                                    // head part with hmdRel from the hand sample, so what is used
+                                    // is the packet's heading with the hands' own head rotation.
+                                    // REVERTED 2026-07-30, by measurement: sourcing vq from the
+                                    // packet instead of the snapshot took VIEWREL rot from 0.44 to
+                                    // 0.95 deg per frame with the controllers lying still. The
+                                    // packet updates on the locate cadence, the snapshot on the
+                                    // publish cadence, and the snapshot is the closer of the two
+                                    // to the frame being solved. The cross-latch mixing with the
+                                    // heading is real, but this was the wrong half to move.
                                     float vq[4] = { SharedPose(104), SharedPose(105), SharedPose(106), SharedPose(107) };
                                     VRIK_QuatNorm(vq);
+                                    // Exhale-smoke mouth point in WORLD space = vpView + rotate(vq, mouthOffset),
+                                    // the same view pose the cig mouth-anchor rides. redscript spawns the smoke
+                                    // fx here so it tracks the real HMD (not the lean-less FPP camera).
+                                    {
+                                        const float mo[3] = { g_VRSmokeSmokePos[0], g_VRSmokeSmokePos[1], g_VRSmokeSmokePos[2] };
+                                        float moW[3]; VRIK_QuatRotateVec(vq, mo, moW);
+                                        g_VRSmokeMouthWorldPos[0] = vpView[0] + moW[0];
+                                        g_VRSmokeMouthWorldPos[1] = vpView[1] + moW[1];
+                                        g_VRSmokeMouthWorldPos[2] = vpView[2] + moW[2];
+                                        const float sr[4] = { g_VRSmokeSmokeRot[0], g_VRSmokeSmokeRot[1], g_VRSmokeSmokeRot[2], g_VRSmokeSmokeRot[3] };
+                                        float wr[4]; VRIK_QuatMul(vq, sr, wr); VRIK_QuatNorm(wr);
+                                        g_VRSmokeMouthWorldRot[0] = wr[0];
+                                        g_VRSmokeMouthWorldRot[1] = wr[1];
+                                        g_VRSmokeMouthWorldRot[2] = wr[2];
+                                        g_VRSmokeMouthWorldRot[3] = wr[3];
+                                        g_VRSmokeMouthWorldValid = 1;
+                                    }
                                     // WORLD->MODEL yaw = game heading from the SAME view
                                     // packet as vq (one seqlocked frame: no snap-turn
                                     // old-vq/new-yaw mix -> no arm double). No HMD yaw
                                     // in any mode: head turns do not rotate the hand
                                     // frame. Fallback (older dxgi): yaw extracted from vq.
                                     float vyaw;
-                                    if (g_viewPktValid) {
+                                      if (g_viewPktValid) {
                                         vyaw = g_viewPkt[8];
                                     } else {
                                         const float fX = 2.0f*(vq[0]*vq[1] - vq[3]*vq[2]);
@@ -2764,11 +3134,41 @@ extern "C" inline void* Hooked_AnimPoseApply(void* a1, void* a2, void* a3, unsig
                                     const float hs = std::sin(vyaw * 0.5f);
                                     const float hc = std::cos(vyaw * 0.5f);
                                     float ec[4] = { 0.0f, 0.0f, -hs, hc };
-                                    float rvM[4]; VRIK_QuatMul(ec, vq, rvM); VRIK_QuatNorm(rvM);
+                                    // TIME-ALIGN THE HAND FRAME. vq is the view orientation
+                                    // from [104..107], written at LocateCamera; the offset it is
+                                    // about to rotate came from the XR sample the hands were
+                                    // published with. Measured: 33.6 ms against 23.5 ms, and at
+                                    // 886 deg/s that 10 ms gap is ~9 deg -- on a half-metre arm,
+                                    // 8 cm of hand displacement, changing every frame. The whole
+                                    // reason the offset is stored head-locally is so head
+                                    // rotation cancels; it only cancels if the two halves are
+                                    // from one instant.
+                                    //
+                                    // vq = heading * mapQ(headOri_view), so replacing its head
+                                    // part with the sample's is a right-multiply by
+                                    // mapQ(conj(headOri_view) * hmdRel). Nothing is assumed about
+                                    // how the heading is built -- it divides out.
+                                    float vqUse[4] = { vq[0], vq[1], vq[2], vq[3] };
+                                    if (g_viewPktValid && CyberpunkVR_VrikHandFrameAlign) {
+                                          const float* vo = &g_viewPkt[13];
+                                        if (vo[0] != 0.0f || vo[1] != 0.0f || vo[2] != 0.0f ||
+                                            vo[3] != 1.0f) {
+                                            const float voc[4] = { -vo[0], -vo[1], -vo[2], vo[3] };
+                                            float dxr[4]; VRIK_QuatMul(voc, hmdRel, dxr);
+                                            const float dg[4] = { dxr[0], -dxr[2], dxr[1], dxr[3] };
+                                            float t2[4]; VRIK_QuatMul(vq, dg, t2);
+                                            VRIK_QuatNorm(t2);
+                                            vqUse[0]=t2[0]; vqUse[1]=t2[1]; vqUse[2]=t2[2]; vqUse[3]=t2[3];
+                                        }
+                                    }
+                                    float rvM[4]; VRIK_QuatMul(ec, vqUse, rvM); VRIK_QuatNorm(rvM);
                                     float vpW[3] = { vpView[0] - g_VREntityPosX,
                                                      vpView[1] - g_VREntityPosY,
                                                      vpView[2] - g_VREntityPosZ };
                                     float vpM[3]; VRIK_QuatRotateVec(ec, vpW, vpM);
+                                    vrViewPosM[0]=vpM[0]; vrViewPosM[1]=vpM[1]; vrViewPosM[2]=vpM[2];
+                                    vrViewRotM[0]=rvM[0]; vrViewRotM[1]=rvM[1]; vrViewRotM[2]=rvM[2]; vrViewRotM[3]=rvM[3];
+                                    vrViewFrameOk = true;
                                     float mp[3] = { vrPos[0]*g_VRScaleR, -vrPos[2]*g_VRScaleR, vrPos[1]*g_VRScaleR };
                                     float rp[3]; VRIK_QuatRotateVec(rvM, mp, rp);
                                     target[0] = vpM[0] + rp[0] + offR[0];
@@ -2799,17 +3199,167 @@ extern "C" inline void* Hooked_AnimPoseApply(void* a1, void* a2, void* a3, unsig
                             rhWristModel[0] = target[0];
                             rhWristModel[1] = target[1];
                             rhWristModel[2] = target[2];
+
+                            // SHAKE, MEASURED AT THREE LEVELS. Every rate and coherence check has
+                            // come back clean, so the next question is not where the data comes
+                            // from but where the wobble is ADDED. Smooth motion has a small second
+                            // difference; a shake has a large one. Same metric on the raw
+                            // controller offset, on the anchor, and on the final target tells
+                            // which stage introduces it -- runtime noise, the anchor, or the
+                            // composition in between. Runs once per fresh solve, so consecutive
+                            // samples are consecutive frames.
+                            {
+                                static float hp[5][3][2] = {};   // [level][axis][age]
+                                static int   hn = 0;
+                                float av[3] = {0.0f, 0.0f, 0.0f};
+                                VRIK_ResolveViewPos(av);   // pure; vpView is scoped inside the branch
+                                // Two more levels, BELOW the target: the wrist can sit perfectly
+                                // still while the arm still flickers, because the arm also hangs
+                                // off the shoulder and the shoulder off the body camera. If those
+                                // move, the IK bends the limb differently every frame -- visible
+                                // as shaking arms with a motionless hand.
+                                const float lv[5][3] = {
+                                    { vrPos[0], vrPos[1], vrPos[2] },
+                                    { av[0], av[1], av[2] },
+                                    { target[0], target[1], target[2] },
+                                    { shoulderModelR[0], shoulderModelR[1], shoulderModelR[2] },
+                                    { camModelPos ? camModelPos[0] : 0.0f,
+                                      camModelPos ? camModelPos[1] : 0.0f,
+                                      camModelPos ? camModelPos[2] : 0.0f } };
+                                if (hn >= 2) {
+                                    for (int L = 0; L < 5; ++L) {
+                                        float a2 = 0.0f;
+                                        for (int k = 0; k < 3; ++k) {
+                                            const float d = lv[L][k] - 2.0f * hp[L][k][0] + hp[L][k][1];
+                                            a2 += d * d;
+                                        }
+                                        const float mm = std::sqrt(a2) * 1000.0f;
+                                        const int slot = (L < 3) ? (224 + L) : (231 + (L - 3));
+                                        if (mm < 500.0f && mm > g_pSharedHands[slot])
+                                            g_pSharedHands[slot] = mm;
+                                    }
+                                }
+                                for (int L = 0; L < 5; ++L)
+                                    for (int k = 0; k < 3; ++k) {
+                                        hp[L][k][1] = hp[L][k][0];
+                                        hp[L][k][0] = lv[L][k];
+                                    }
+                                if (hn < 2) ++hn;
+                            }
                             rhWristValid = true;
                             VRIK_SolveArm(boneBuf, g_VRRightUpperArmIdx, g_VRRightForeArmIdx,
                                           g_VRRightBoneIdx, target, handRot,
                                           bodyRight, bodyUp, bodyFwd,
                                           g_VRElbowPoleR * 0.01745329252f, g_VRElbowSwingR,
                                           /*isLeft*/false, /*storeDbg*/true);
+                            // SMOKING: head<->cig-hand distance. vrPos is the right controller expressed
+                            // RELATIVE TO THE HMD (HMD-local, metres) -- the same input the arm solve
+                            // maps into model space. Its magnitude is literally how far the cig hand
+                            // (the WeaponRight slot rides it) is from the head: small when the cig is at
+                            // the mouth ("weapon slot just below the head"), ~0.6 with the arm down.
+                            // No model-space anchor to get wrong (that was the chest-vs-eye bug).
+                            {
+                                const float dx = vrPos[0], dy = vrPos[1], dz = vrPos[2];
+                                g_VRSmokeMouthDist = std::sqrt(dx*dx + dy*dy + dz*dz);
+                            }
+
+                            // MOUTH ANCHOR: pin the cig to a head-anchored point so it stays at the
+                            // lips when the hand drops. The cig (g_VRSmokeCigIdx / WeaponRight) is a
+                            // descendant of the SOLVED hand -- (target, handRot) is the hand model
+                            // transform. Walk from the cig slot up to the hand to get the slot's PARENT
+                            // model transform (robust whether it is a direct child or deeper), then set
+                            // the slot LOCAL = parentModel^-1 . mouthModel so its model pose == the
+                            // head-anchored mouth pose. Overrides the grip-pose write from earlier this
+                            // pass; runs every (replayed) solve so it never flickers.
+                            if (g_VRSmokeMouthAnchor && g_VRSmokeMouthBoneIdx >= 0 && g_VRSmokeMouthBoneIdx < VRIK_MAX_BONES
+                                && vrViewFrameOk) {
+                                int chain[16]; int cn = 0; bool reachedHand = false;
+                                int a = g_VRBoneParent[g_VRSmokeMouthBoneIdx];
+                                while (a >= 0 && a < VRIK_MAX_BONES && cn < 16) {
+                                    if (a == g_VRRightBoneIdx) { reachedHand = true; break; }
+                                    chain[cn++] = a; a = g_VRBoneParent[a];
+                                }
+                                if (reachedHand) {
+                                    // parentModel: start at the hand, compose intermediate locals down to the slot's parent.
+                                    float pmPos[3] = { target[0], target[1], target[2] };
+                                    float pmRot[4] = { handRot[0], handRot[1], handRot[2], handRot[3] };
+                                    for (int k = cn - 1; k >= 0; --k) {
+                                        const float* lt = reinterpret_cast<const float*>(boneBuf + chain[k]*48 + VRIK_TRANS_OFF);
+                                        const float* lr = reinterpret_cast<const float*>(boneBuf + chain[k]*48 + VRIK_ROT_OFF);
+                                        float rp[3]; VRIK_QuatRotateVec(pmRot, lt, rp);
+                                        pmPos[0]+=rp[0]; pmPos[1]+=rp[1]; pmPos[2]+=rp[2];
+                                        float nr[4]; VRIK_QuatMul(pmRot, lr, nr); VRIK_QuatNorm(nr);
+                                        pmRot[0]=nr[0]; pmRot[1]=nr[1]; pmRot[2]=nr[2]; pmRot[3]=nr[3];
+                                    }
+                                    // Desired cig MODEL pose = VIEW (HMD) transform . (offset, rot). vpM/rvM
+                                    // track real head yaw+pitch+position (the avatar head BONE is idle in FPP,
+                                    // which is why anchoring to it left the cig hanging in space). Offset is
+                                    // HMD-local, same frame as the hand target: x=right, y=forward, z=up (m).
+                                    const float mo[3]  = { g_VRSmokeMouthPos[0], g_VRSmokeMouthPos[1], g_VRSmokeMouthPos[2] };
+                                    const float mrl[4] = { g_VRSmokeMouthRot[0], g_VRSmokeMouthRot[1], g_VRSmokeMouthRot[2], g_VRSmokeMouthRot[3] };
+                                    float moW[3]; VRIK_QuatRotateVec(vrViewRotM, mo, moW);
+                                    const float mouthPos[3] = { vrViewPosM[0]+moW[0], vrViewPosM[1]+moW[1], vrViewPosM[2]+moW[2] };
+                                    float mouthRot[4]; VRIK_QuatMul(vrViewRotM, mrl, mouthRot); VRIK_QuatNorm(mouthRot);
+                                    float pmConj[4]; VRIK_QuatConj(pmRot, pmConj);
+                                    float rel[3] = { mouthPos[0]-pmPos[0], mouthPos[1]-pmPos[1], mouthPos[2]-pmPos[2] };
+                                    float localPos[3]; VRIK_QuatRotateVec(pmConj, rel, localPos);
+                                    float localRot[4]; VRIK_QuatMul(pmConj, mouthRot, localRot); VRIK_QuatNorm(localRot);
+                                    // Store for the every-pass grip-apply block to replay (and write now for this pass).
+                                    g_VRSmokeAnchorLocalPos[0]=localPos[0]; g_VRSmokeAnchorLocalPos[1]=localPos[1]; g_VRSmokeAnchorLocalPos[2]=localPos[2];
+                                    g_VRSmokeAnchorLocalRot[0]=localRot[0]; g_VRSmokeAnchorLocalRot[1]=localRot[1]; g_VRSmokeAnchorLocalRot[2]=localRot[2]; g_VRSmokeAnchorLocalRot[3]=localRot[3];
+                                    g_VRSmokeAnchorValid = 1;
+                                    float* t = reinterpret_cast<float*>(boneBuf + g_VRSmokeMouthBoneIdx*48 + VRIK_TRANS_OFF);
+                                    float* q = reinterpret_cast<float*>(boneBuf + g_VRSmokeMouthBoneIdx*48 + VRIK_ROT_OFF);
+                                    t[0]=localPos[0]; t[1]=localPos[1]; t[2]=localPos[2];
+                                    q[0]=localRot[0]; q[1]=localRot[1]; q[2]=localRot[2]; q[3]=localRot[3];
+                                }
+                            }
+                            // GENERAL mouth-pin: same lips pose but for an arbitrary NON-hand bone
+                            // (Neck1/Head/Neck), so a prop on a non-weapon slot rides the mouth with
+                            // BOTH hands + weapon slots free. Local = parentModel^-1 * mouthModel,
+                            // using the parent's model FK (g_fkPos/g_fkRot). Stored; applied every pass.
+                            {
+                                int abSel = g_VRSmokeAnchorBoneSel;
+                                int ab = (abSel==1) ? g_VRNeck1Idx : (abSel==2) ? g_VRHeadBoneIdx : (abSel==3) ? g_VRNeckIdx : -1;
+                                g_VRSmokeAnchorBoneIdx = ab;
+                                if (g_VRSmokeMouthAnchor && vrViewFrameOk && ab >= 0 && ab < VRIK_MAX_BONES) {
+                                    int pa = g_VRBoneParent[ab];
+                                    if (pa >= 0 && pa < VRIK_MAX_BONES) {
+                                        const float amo[3]  = { g_VRSmokeMouthPos[0], g_VRSmokeMouthPos[1], g_VRSmokeMouthPos[2] };
+                                        const float amrl[4] = { g_VRSmokeMouthRot[0], g_VRSmokeMouthRot[1], g_VRSmokeMouthRot[2], g_VRSmokeMouthRot[3] };
+                                        float amoW[3]; VRIK_QuatRotateVec(vrViewRotM, amo, amoW);
+                                        const float amouthPos[3] = { vrViewPosM[0]+amoW[0], vrViewPosM[1]+amoW[1], vrViewPosM[2]+amoW[2] };
+                                        float amouthRot[4]; VRIK_QuatMul(vrViewRotM, amrl, amouthRot); VRIK_QuatNorm(amouthRot);
+                                        const float* ppos = g_fkPos[pa]; const float* prot = g_fkRot[pa];
+                                        float pInv[4]; VRIK_QuatConj(prot, pInv);
+                                        float alrot[4]; VRIK_QuatMul(pInv, amouthRot, alrot); VRIK_QuatNorm(alrot);
+                                        float ad[3] = { amouthPos[0]-ppos[0], amouthPos[1]-ppos[1], amouthPos[2]-ppos[2] };
+                                        float alpos[3]; VRIK_QuatRotateVec(pInv, ad, alpos);
+                                        g_VRSmokeAltAnchorLocalPos[0]=alpos[0]; g_VRSmokeAltAnchorLocalPos[1]=alpos[1]; g_VRSmokeAltAnchorLocalPos[2]=alpos[2];
+                                        g_VRSmokeAltAnchorLocalRot[0]=alrot[0]; g_VRSmokeAltAnchorLocalRot[1]=alrot[1]; g_VRSmokeAltAnchorLocalRot[2]=alrot[2]; g_VRSmokeAltAnchorLocalRot[3]=alrot[3];
+                                        g_VRSmokeAltAnchorValid = 1;
+                                        // APPLY here (post body/hip solve) so pinning a structural bone
+                                        // doesn't fling the VRIK body anchor. Write the bone's local now.
+                                        float* abt = reinterpret_cast<float*>(boneBuf + ab*48 + VRIK_TRANS_OFF);
+                                        float* abq = reinterpret_cast<float*>(boneBuf + ab*48 + VRIK_ROT_OFF);
+                                        abt[0]=alpos[0]; abt[1]=alpos[1]; abt[2]=alpos[2];
+                                        abq[0]=alrot[0]; abq[1]=alrot[1]; abq[2]=alrot[2]; abq[3]=alrot[3];
+                                    }
+                                } else if (abSel == 0) {
+                                    g_VRSmokeAltAnchorValid = 0;
+                                }
+                            }
                         }
                         // Left arm.
                         if (SharedPose(0) > 0.0f && g_VRLeftUpperArmIdx >= 0) {
                             const float vrPos[3]  = { SharedPose(1), SharedPose(2), SharedPose(3) };
                             const float vrQuat[4] = { SharedPose(4), SharedPose(5), SharedPose(6), SharedPose(7) };
+                            // SMOKING: LEFT hand <-> mouth distance (mirror of g_VRSmokeMouthDist for the
+                            // left controller). |vrPos| = how far the left hand is from the head (HMD-local
+                            // metres) -- small when the left hand is at the lips. Lets the LEFT grip toggle
+                            // the cig when the LEFT hand (not the right) is the one raised to the mouth.
+                            { const float dxl=vrPos[0], dyl=vrPos[1], dzl=vrPos[2];
+                              g_VRSmokeMouthDistL = std::sqrt(dxl*dxl + dyl*dyl + dzl*dzl); }
                             float target[3], handRot[4];
                             const float wristL[4]       = { g_VRWristL_I, g_VRWristL_J, g_VRWristL_K, g_VRWristL_R };
                             const float offL[3]         = { g_VROffLX, g_VROffLY, g_VROffLZ };
@@ -2835,6 +3385,27 @@ extern "C" inline void* Hooked_AnimPoseApply(void* a1, void* a2, void* a3, unsig
                                     // было трейла"). The packet source lagged the rendered view
                                     // by one sample -> the left-only trail; the snapshot path
                                     // was trail-free on the right in user testing.
+                                    // ONE LATCH FOR THE WHOLE FRAME OF REFERENCE. vq used to be
+                                    // read from the hands snapshot while the heading and the head
+                                    // orientation beside it came from the view packet -- two
+                                    // seqlocks, two instants. The comment below still claims they
+                                    // are the same packet; they were not. With the camera doing
+                                    // its idle sway the two drift apart, and the difference lands
+                                    // straight on the hand's ROTATION: measured 0.44 deg per frame
+                                    // with the controllers lying on the table.
+                                    //
+                                    // Taking vq from the packet was tried before and left a trail,
+                                    // because the packet lags the rendered view by a sample. That
+                                    // objection is gone: the alignment below replaces the packet's
+                                    // head part with hmdRel from the hand sample, so what is used
+                                    // is the packet's heading with the hands' own head rotation.
+                                    // REVERTED 2026-07-30, by measurement: sourcing vq from the
+                                    // packet instead of the snapshot took VIEWREL rot from 0.44 to
+                                    // 0.95 deg per frame with the controllers lying still. The
+                                    // packet updates on the locate cadence, the snapshot on the
+                                    // publish cadence, and the snapshot is the closer of the two
+                                    // to the frame being solved. The cross-latch mixing with the
+                                    // heading is real, but this was the wrong half to move.
                                     float vq[4] = { SharedPose(104), SharedPose(105), SharedPose(106), SharedPose(107) };
                                     VRIK_QuatNorm(vq);
                                     // WORLD->MODEL yaw = game heading from the SAME view
@@ -2843,7 +3414,7 @@ extern "C" inline void* Hooked_AnimPoseApply(void* a1, void* a2, void* a3, unsig
                                     // in any mode: head turns do not rotate the hand
                                     // frame. Fallback (older dxgi): yaw extracted from vq.
                                     float vyaw;
-                                    if (g_viewPktValid) {
+                                      if (g_viewPktValid) {
                                         vyaw = g_viewPkt[8];
                                     } else {
                                         const float fX = 2.0f*(vq[0]*vq[1] - vq[3]*vq[2]);
@@ -2853,7 +3424,34 @@ extern "C" inline void* Hooked_AnimPoseApply(void* a1, void* a2, void* a3, unsig
                                     const float hs = std::sin(vyaw * 0.5f);
                                     const float hc = std::cos(vyaw * 0.5f);
                                     float ec[4] = { 0.0f, 0.0f, -hs, hc };
-                                    float rvM[4]; VRIK_QuatMul(ec, vq, rvM); VRIK_QuatNorm(rvM);
+                                    // TIME-ALIGN THE HAND FRAME. vq is the view orientation
+                                    // from [104..107], written at LocateCamera; the offset it is
+                                    // about to rotate came from the XR sample the hands were
+                                    // published with. Measured: 33.6 ms against 23.5 ms, and at
+                                    // 886 deg/s that 10 ms gap is ~9 deg -- on a half-metre arm,
+                                    // 8 cm of hand displacement, changing every frame. The whole
+                                    // reason the offset is stored head-locally is so head
+                                    // rotation cancels; it only cancels if the two halves are
+                                    // from one instant.
+                                    //
+                                    // vq = heading * mapQ(headOri_view), so replacing its head
+                                    // part with the sample's is a right-multiply by
+                                    // mapQ(conj(headOri_view) * hmdRel). Nothing is assumed about
+                                    // how the heading is built -- it divides out.
+                                    float vqUse[4] = { vq[0], vq[1], vq[2], vq[3] };
+                                    if (g_viewPktValid && CyberpunkVR_VrikHandFrameAlign) {
+                                          const float* vo = &g_viewPkt[13];
+                                        if (vo[0] != 0.0f || vo[1] != 0.0f || vo[2] != 0.0f ||
+                                            vo[3] != 1.0f) {
+                                            const float voc[4] = { -vo[0], -vo[1], -vo[2], vo[3] };
+                                            float dxr[4]; VRIK_QuatMul(voc, hmdRel, dxr);
+                                            const float dg[4] = { dxr[0], -dxr[2], dxr[1], dxr[3] };
+                                            float t2[4]; VRIK_QuatMul(vq, dg, t2);
+                                            VRIK_QuatNorm(t2);
+                                            vqUse[0]=t2[0]; vqUse[1]=t2[1]; vqUse[2]=t2[2]; vqUse[3]=t2[3];
+                                        }
+                                    }
+                                    float rvM[4]; VRIK_QuatMul(ec, vqUse, rvM); VRIK_QuatNorm(rvM);
                                     float vpW[3] = { vpView[0] - g_VREntityPosX,
                                                      vpView[1] - g_VREntityPosY,
                                                      vpView[2] - g_VREntityPosZ };

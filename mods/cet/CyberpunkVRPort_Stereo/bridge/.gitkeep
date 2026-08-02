@@ -1,0 +1,10 @@
+# One-way notes between the native plugin and modules/vrcam_select.lua. The folder has to exist
+# because Lua only writes here (io.open "w" will not create a directory) -- hence this file.
+#
+#   vrcam_enable.txt   native -> Lua. "1" or "0": the overlay's Enable/Disable VRCAM button.
+#   vrcam_active.txt   Lua -> native. The virtualCameraName of the component actually enabled,
+#                      read back off the live component so the view key comes from the asset
+#                      rather than from a naming assumption.
+#
+# Both are rewritten in place and polled; neither is a queue. Nothing else lives here any more --
+# the old command.json / status.json pair belonged to the testbed dxgi.dll and is gone with it.

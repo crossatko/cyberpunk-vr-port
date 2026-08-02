@@ -1,5 +1,8 @@
 #include <RED4ext/RED4ext.hpp>
 #include <RED4ext/GameEngine.hpp>
+#include <sstream>
+#include <locale>
+#include <clocale>
 #include "../common/shared_slots.h"   // CyberpunkVR_Hands_Shared slot map (single source of truth)
 #include <RED4ext/Containers/StaticArray.hpp>
 #include <RED4ext/Scripting/Natives/ScriptGameInstance.hpp>
@@ -309,6 +312,10 @@ volatile int       g_VRIKSolvesMaxTick = 0;
 volatile uintptr_t g_VRIKLastBufA = 0;
 volatile uintptr_t g_VRIKLastBufB = 0;
 volatile int       g_VRIKReplayTotal = 0;
+// Fresh solves, i.e. how often the arms/body actually move. The replay path re-writes the SAME
+// pose bit for bit, so this counter -- not the pose-apply count -- is the VRIK frame rate.
+volatile int       g_VRIKFreshTotal = 0;
+volatile int       CyberpunkVR_VrikHandFrameAlign = 1;
 volatile float     g_VRIKDbgChestTgt[3] = {0,0,0};
 // Anatomical offset from the HMD to the SHOULDER joint, in HMD-LOCAL OpenXR axes
 // (X = right, Y = up, Z = backward). The plugin uses this to convert the HMD-local controller
@@ -367,8 +374,93 @@ volatile int       g_VRUseHeadRelative = 1;
 volatile int       g_VRDiagCapture = 0;
 float              g_VRDiagBones[32 * 7] = {0};
 
+// SMOKE FINGER-HOLD pose (see vrik_hook.h). Right-hand deform finger + metacarpal bones
+// only; captured live from the vanilla hold-cigarette workspot and replayed each pass to
+// curl the fingers around the cigarette while VRIK keeps the wrist on the controller.
+volatile int       g_VRSmokeFingerActive  = 0;
+volatile int       g_VRSmokeFingerCapture = 0;
+volatile int       g_VRSmokeFingerHave    = 0;
+volatile int       g_VRSmokeFingerCount   = 0;
+int                g_VRSmokeFingerIdx[32] = {0};
+float              g_VRSmokeFingerRot[32][4] = {{0}};
+char               g_VRSmokeFingerName[32][48] = {};   // finger bone names (name-keyed dump/load)
+// Cigarette slot = WeaponRight bone (28, child of RightHand): moving its LOCAL transform
+// moves the attached cig so it sits in the captured finger pinch. Full T+R (unlike fingers,
+// rotation-only). Live nudge (OffP/OffQ) lets the pose be fine-tuned in VR then baked.
+volatile int       g_VRSmokeCigIdx    = -1;
+volatile int       g_VRSmokeMouthBoneIdx = -1;   // WeaponRight1 leaf: pinned to the mouth (cig at lips)
+volatile int       g_VRSmokeCigHave   = 0;
+volatile int       g_VRSmokeCigEnable = 1;            // 0 = leave WeaponRight alone (fingers only)
+float              g_VRSmokeCigPos[3] = {0.0f, 0.0f, 0.0f};
+float              g_VRSmokeCigRot[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+volatile float     g_VRSmokeCigOffP[3] = {-0.012f, -0.008f, -0.015f}; // hand grip position nudge (bone-local) [tuned]
+volatile float     g_VRSmokeCigOffQ[4] = {0.0f, 0.0f, 0.0f, 1.0f}; // live rotation nudge (quat)
+volatile float     g_VRSmokeMouthDist  = 999.0f;                // cig-slot -> mouth, model space (VRIK frame)
+volatile float     g_VRSmokeMouthDistL = 999.0f;                // LEFT hand -> mouth (HMD-local metres)
+// MOUTH ANCHOR: when set, the pose hook pins the cig (WeaponRight bone) to a head-anchored point so
+// it stays at the lips hands-free (arm can drop). Pos = model-space offset from the head bone; Rot =
+// the cig's model-space orientation at the mouth. Both live-tunable via SetVRSmokeMouthOffset in VR.
+volatile int       g_VRSmokeMouthAnchor = 0;
+volatile float     g_VRSmokeMouthPos[3] = {0.0f, 0.07f, -0.08f};   // HMD-local: x=right, y=forward, z=up (m) [tuned]
+volatile float     g_VRSmokeMouthRot[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+// WeaponRight LOCAL transform that pins the cig at the mouth, computed by the fresh arm solve and
+// replayed in the every-pass grip-apply block (so replays don't snap the cig back to the hand).
+volatile int       g_VRSmokeAnchorValid  = 0;
+volatile float     g_VRSmokeAnchorLocalPos[3] = {0.0f, 0.0f, 0.0f};
+volatile float     g_VRSmokeAnchorLocalRot[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+// GENERAL mouth-pin: pin an ARBITRARY (non-hand) bone to the HMD mouth so a prop attached to a
+// non-weapon slot (e.g. Splinter->Neck1/Head) rides the lips hands-free, leaving BOTH weapon slots
+// free. Sel: 0=off (use the WeaponRight path above), 1=Neck1, 2=Head, 3=Neck. Resolved to a bone
+// index in the pose hook; local computed from the parent's model FK + the mouth model pose.
+volatile int       g_VRSmokeAnchorBoneSel  = 0;
+volatile int       g_VRSmokeAnchorBoneIdx  = -1;
+volatile int       g_VRSmokeAltAnchorValid = 0;
+volatile float     g_VRSmokeAltAnchorLocalPos[3] = {0.0f, 0.0f, 0.0f};
+volatile float     g_VRSmokeAltAnchorLocalRot[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+// Burn-down: cig slot-bone Y scale (1.0 full .. shrinks as it burns). Experiment: whether the item
+// attachment inherits the WeaponRight bone scale. Driven from reds (burn length).
+volatile float     g_VRSmokeCigScaleY   = 1.0f;
+// Exhale smoke: its OWN HMD-local offset (pos + orientation), tunable live, independent of the cig
+// mouth anchor. World pose (below) = view pose (real HMD) composed with these.
+volatile float     g_VRSmokeSmokePos[3]  = {0.0f, 0.07f, -0.08f};
+volatile float     g_VRSmokeSmokeRot[4]  = {0.0f, 0.0f, 0.0f, 1.0f};
+volatile float     g_VRSmokeMouthWorldPos[3] = {0.0f, 0.0f, 0.0f};
+volatile float     g_VRSmokeMouthWorldRot[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+volatile int       g_VRSmokeMouthWorldValid  = 0;
+
+// LEFT-HAND mirror (lighter grip): same machinery for the left fingers + WeaponLeft slot.
+volatile int       g_VRSmokeFingerActiveL  = 0;
+volatile int       g_VRSmokeFingerCaptureL = 0;
+volatile int       g_VRSmokeFingerHaveL    = 0;
+volatile int       g_VRSmokeFingerCountL   = 0;
+int                g_VRSmokeFingerIdxL[32] = {0};
+float              g_VRSmokeFingerRotL[32][4] = {{0}};
+char               g_VRSmokeFingerNameL[32][48] = {};
+volatile int       g_VRSmokeLighterIdx    = -1;   // WeaponLeft bone
+volatile int       g_VRSmokeLighterHave   = 0;
+volatile int       g_VRSmokeLighterEnable = 1;
+float              g_VRSmokeLighterPos[3] = {0.0f, 0.0f, 0.0f};
+float              g_VRSmokeLighterRot[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+volatile float     g_VRSmokeLighterOffP[3] = {0.0f, 0.0f, 0.0f};
+volatile float     g_VRSmokeLighterOffQ[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+// LEFT thumb "press the lighter" flick: extra rotation added to the left thumb bones,
+// scaled by press (0..1) = left VR trigger (shared[67]) or the manual override (tuning).
+volatile float     g_VRSmokeThumbFlickL[4] = {0.0f, 0.0f, 0.0f, 1.0f}; // full-press delta quat
+volatile float     g_VRSmokeThumbPressManualL = 0.0f;                   // >0 forces press (test/tune)
+int                g_VRSmokeThumbIsL[32] = {0};                         // 1 if that left finger slot is a thumb bone
+
+// LEFT-HAND CIGARETTE grip (separate from the lighter): used when the cig is grabbed into the LEFT
+// hand from the mouth. Same left finger bones (g_VRSmokeFingerIdxL / g_VRSmokeFingerCountL / NameL)
+// but a different pose, loaded from CyberpunkVR_SmokeGrip_Left.ini. g_VRSmokeLeftUseCig picks which
+// pose the left-hand apply uses: 0 = lighter, 1 = cigarette.
+volatile int       g_VRSmokeLeftUseCig  = 0;
+volatile int       g_VRSmokeCigLHave    = 0;              // cig-left pose available (fingers + WeaponLeft slot)
+float              g_VRSmokeFingerRotLC[32][4] = {{0}};   // parallel to g_VRSmokeFingerRotL (same bones)
+float              g_VRSmokeCigLPos[3]  = {0.0f, 0.0f, 0.0f};
+float              g_VRSmokeCigLRot[4]  = {0.0f, 0.0f, 0.0f, 1.0f};
+
 // Full-arm IK (g_VRBind == 4): bone hierarchy + chain indices (resolved in VRIK_DoArmPlayer).
-int16_t            g_VRBoneParent[256] = {0};
+int16_t            g_VRBoneParent[800] = {0};
 volatile int       g_VRBoneCount = 0;
 volatile int       g_VRFKCount = 0;   // solver-touched bone prefix (0 = use full count)
 volatile int       g_VRRightUpperArmIdx = -1; // RightArm  (upper-arm start / shoulder joint)
@@ -3795,6 +3887,9 @@ void InstallWeaponAimHook(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* 
 }
 
 // Writes the current hook stats + last sampled vectors to weapon_aim_native.txt.
+// Defined below, with the provider table it reads -- the constants and arrays live down there.
+static void DumpProviderSlots(std::ofstream& out);
+
 void DumpWeaponAimHookStats(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
     RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
     aFrame->code++;
@@ -3804,6 +3899,7 @@ void DumpWeaponAimHookStats(RED4ext::IScriptable* aContext, RED4ext::CStackFrame
     out << "XFORM-GETTER calls=" << g_xfCalls << " mutated=" << g_xfMutated
         << " mode=" << g_xfMode << " testYaw=" << g_xfTestYaw << " shotInProg=" << g_shotInProgress << "  <== THE camera->shot lever\n";
     out << "  xf out-orient = " << g_xfLastOut[0] << " " << g_xfLastOut[1] << " " << g_xfLastOut[2] << " " << g_xfLastOut[3] << "\n";
+    DumpProviderSlots(out);
     out << "SHOTSNAP calls=" << g_ssCalls << " snapped=" << g_ssSnapped
         << " camPtr=0x" << std::hex << g_ssCamPtr << std::dec
         << " enable=" << g_ssEnable << " mode=" << g_ssMode << " testYaw=" << g_ssTestYaw << "\n";
@@ -4417,6 +4513,13 @@ static int VRIK_DoArmPlayer() {
             int rightArm = -1, rightFore = -1, leftArm = -1, leftFore = -1;
             int spineTmp[8] = {-1,-1,-1,-1,-1,-1,-1,-1};
             int spineTmpCount = 0;
+            int smokeFingerTmp[32]; int smokeFingerTmpCount = 0;
+            char smokeFingerNameTmp[32][48] = {};
+            int smokeCigTmp = -1;
+    int smokeMouthBoneTmp = -1;
+            int smokeFingerTmpL[32]; int smokeFingerTmpCountL = 0;
+            char smokeFingerNameTmpL[32][48] = {};
+            int smokeLighterTmp = -1;
             const size_t kNoMatch = static_cast<size_t>(-1);
             size_t headLen = kNoMatch, rightLen = kNoMatch, leftLen = kNoMatch;
             for (uint32_t i = 0; i < boneCount; ++i)
@@ -4479,6 +4582,43 @@ static int VRIK_DoArmPlayer() {
                 if (EqualsInsensitive(nm, "l_forearmTwist01_JNT")) g_VRForeTwistL[0] = static_cast<int>(i);
                 if (EqualsInsensitive(nm, "l_forearmTwist02_JNT")) g_VRForeTwistL[1] = static_cast<int>(i);
                 if (EqualsInsensitive(nm, "l_forearmTwist03_JNT")) g_VRForeTwistL[2] = static_cast<int>(i);
+
+                // Right-hand FINGER bones for the smoke "hold cigarette" fingers-only grip.
+                // Deform finger + metacarpal joints have "right"+"hand" in the name but are
+                // NOT the wrist ("RightHand"), NOT control joints ("_setup") and NOT the hand
+                // tip ("RightHandEnd"). Muscle joints ("r_thumb_*") lack the word "right", so
+                // the isHand+"right" gate skips them. Captures RightInHand{Thumb..Pinky} and
+                // RightHand{Thumb,Index,Middle,Ring,Pinky}{1..3}.
+                // Real deform finger bones (RightHandThumb1, RightInHandIndex, ...) have NO
+                // underscore; the false matches that slipped in (Torso_*Arm_Hand_IK_JNT control
+                // joints, shadow_RightHand) all contain '_'. Excluding '_' cleanly keeps only the
+                // finger bones. "end" still filters RightHandEnd (no underscore).
+                if (isHand && ContainsInsensitive(nm, "right")
+                    && !EqualsInsensitive(nm, "RightHand")
+                    && !ContainsInsensitive(nm, "_")
+                    && !ContainsInsensitive(nm, "end")
+                    && smokeFingerTmpCount < 32) {
+                    std::strncpy(smokeFingerNameTmp[smokeFingerTmpCount], nm, 47);
+                    smokeFingerTmp[smokeFingerTmpCount++] = static_cast<int>(i);
+                }
+                // Cigarette slot bone (child of RightHand); moving its local transform
+                // positions the attached cig into the finger pinch.
+                // In-hand grip rides WeaponRight (same as the weapon). The MOUTH pin rides WeaponRight1
+                // -- a custom LEAF copy of WeaponRight (child of RightHand) added to the rig -- so the cig
+                // at the lips leaves WeaponRight free for a pistol, and pinning the leaf moves only it.
+                if (EqualsInsensitive(nm, "WeaponRight"))  smokeCigTmp = static_cast<int>(i);
+                if (EqualsInsensitive(nm, "WeaponRight1")) smokeMouthBoneTmp = static_cast<int>(i);
+
+                // LEFT-hand mirror (lighter grip).
+                if (isHand && ContainsInsensitive(nm, "left")
+                    && !EqualsInsensitive(nm, "LeftHand")
+                    && !ContainsInsensitive(nm, "_")
+                    && !ContainsInsensitive(nm, "end")
+                    && smokeFingerTmpCountL < 32) {
+                    std::strncpy(smokeFingerNameTmpL[smokeFingerTmpCountL], nm, 47);
+                    smokeFingerTmpL[smokeFingerTmpCountL++] = static_cast<int>(i);
+                }
+                if (EqualsInsensitive(nm, "WeaponLeft")) smokeLighterTmp = static_cast<int>(i);
             }
 
             if (head >= 0)      g_VRHeadBoneIdx  = head;
@@ -4491,11 +4631,162 @@ static int VRIK_DoArmPlayer() {
             g_VRSpineCount = spineTmpCount;
             for (int s = 0; s < 8; ++s) g_VRSpineIdx[s] = (s < spineTmpCount) ? spineTmp[s] : -1;
 
+            // Publish the right-hand finger bone set. This resolve re-runs on every VRIK desync;
+            // only (re)init rotations to identity BEFORE we have a pose. Otherwise a desync would
+            // wipe the loaded/captured pose back to identity (straight/flat fingers) -> the
+            // "loads flat, capture works until the next desync" bug. Once have==1 the (stable
+            // same-skeleton) idx/name mapping is unchanged, so rot[] stays valid.
+            const bool initRotR = (g_VRSmokeFingerHave == 0);
+            for (int s = 0; s < 32; ++s) {
+                g_VRSmokeFingerIdx[s] = (s < smokeFingerTmpCount) ? smokeFingerTmp[s] : -1;
+                if (s < smokeFingerTmpCount) std::strncpy(g_VRSmokeFingerName[s], smokeFingerNameTmp[s], 47);
+                else                         g_VRSmokeFingerName[s][0] = '\0';
+                if (initRotR) { g_VRSmokeFingerRot[s][0]=0.0f; g_VRSmokeFingerRot[s][1]=0.0f;
+                                g_VRSmokeFingerRot[s][2]=0.0f; g_VRSmokeFingerRot[s][3]=1.0f; }
+            }
+            g_VRSmokeFingerCount = smokeFingerTmpCount;
+            g_VRSmokeCigIdx = smokeCigTmp;
+            g_VRSmokeMouthBoneIdx = smokeMouthBoneTmp;
+
+            // LEFT-hand publish (mirror). Same desync-preservation guard as the right hand.
+            const bool initRotL = (g_VRSmokeFingerHaveL == 0);
+            for (int s = 0; s < 32; ++s) {
+                g_VRSmokeFingerIdxL[s] = (s < smokeFingerTmpCountL) ? smokeFingerTmpL[s] : -1;
+                if (s < smokeFingerTmpCountL) std::strncpy(g_VRSmokeFingerNameL[s], smokeFingerNameTmpL[s], 47);
+                else                          g_VRSmokeFingerNameL[s][0] = '\0';
+                if (initRotL) { g_VRSmokeFingerRotL[s][0]=0.0f; g_VRSmokeFingerRotL[s][1]=0.0f;
+                                g_VRSmokeFingerRotL[s][2]=0.0f; g_VRSmokeFingerRotL[s][3]=1.0f; }
+                // Left thumb bones get the trigger-driven press flick.
+                g_VRSmokeThumbIsL[s] = (s < smokeFingerTmpCountL
+                                        && ContainsInsensitive(smokeFingerNameTmpL[s], "thumb")) ? 1 : 0;
+            }
+            g_VRSmokeFingerCountL = smokeFingerTmpCountL;
+            g_VRSmokeLighterIdx = smokeLighterTmp;
+
+            // AUTO-LOAD the baked grip poses once (so no re-capture per session). Two files next
+            // to Cyberpunk2077.exe (bin\x64\): CyberpunkVR_SmokeGrip_right.ini (cigarette) and
+            // CyberpunkVR_LighterGrip_Left.ini (lighter). Name-keyed by bone -> survives index
+            // shifts / male-female skeletons. F=finger rot; C=slot pos+rot (WeaponRight cig /
+            // WeaponLeft lighter); K=LeftThumbFlick delta. Both files parsed with the same logic.
+            static bool s_smokeGripLoaded = false;
+            if (!s_smokeGripLoaded && (smokeFingerTmpCount > 0 || smokeFingerTmpCountL > 0)) {
+                s_smokeGripLoaded = true;
+                const char* files[2] = { "CyberpunkVR_SmokeGrip_right.ini", "CyberpunkVR_LighterGrip_Left.ini" };
+                int rFing = 0, lFing = 0; bool cigLoaded = false, ltrLoaded = false;
+                for (int fi = 0; fi < 2; ++fi) {
+                    std::ifstream f(VRDiagPath(files[fi]));
+                    if (!f.is_open()) continue;
+                    std::string line;
+                    while (std::getline(f, line)) {
+                        if (line.empty() || line[0] == '#') continue;
+                        // Locale-INDEPENDENT parse. The file always uses '.' as the decimal, but the
+                        // CRT locale may be ','-decimal at load time -> sscanf("%f") would misparse
+                        // "0.5" and drop the value (loads flat while an in-session capture works,
+                        // because capture is a pure in-memory float copy). classic() forces '.'.
+                        std::istringstream iss(line);
+                        iss.imbue(std::locale::classic());
+                        std::string tag, nm;
+                        if (!(iss >> tag >> nm)) continue;
+                        float a=0,b=0,c=0,d=0,e=0,g=0,h=0;
+                        if (tag == "F") {
+                            if (iss >> a >> b >> c >> d) {
+                                bool hit = false;
+                                for (int k = 0; k < g_VRSmokeFingerCount && k < 32; ++k) {
+                                    if (EqualsInsensitive(g_VRSmokeFingerName[k], nm.c_str())) {
+                                        g_VRSmokeFingerRot[k][0]=a; g_VRSmokeFingerRot[k][1]=b;
+                                        g_VRSmokeFingerRot[k][2]=c; g_VRSmokeFingerRot[k][3]=d;
+                                        ++rFing; hit = true; break;
+                                    }
+                                }
+                                if (!hit) for (int k = 0; k < g_VRSmokeFingerCountL && k < 32; ++k) {
+                                    if (EqualsInsensitive(g_VRSmokeFingerNameL[k], nm.c_str())) {
+                                        g_VRSmokeFingerRotL[k][0]=a; g_VRSmokeFingerRotL[k][1]=b;
+                                        g_VRSmokeFingerRotL[k][2]=c; g_VRSmokeFingerRotL[k][3]=d;
+                                        ++lFing; break;
+                                    }
+                                }
+                            }
+                        } else if (tag == "C") {
+                            if (iss >> a >> b >> c >> d >> e >> g >> h) {
+                                if (EqualsInsensitive(nm.c_str(), "WeaponLeft")) {
+                                    g_VRSmokeLighterPos[0]=a; g_VRSmokeLighterPos[1]=b; g_VRSmokeLighterPos[2]=c;
+                                    g_VRSmokeLighterRot[0]=d; g_VRSmokeLighterRot[1]=e; g_VRSmokeLighterRot[2]=g; g_VRSmokeLighterRot[3]=h;
+                                    ltrLoaded = true;
+                                } else {
+                                    g_VRSmokeCigPos[0]=a; g_VRSmokeCigPos[1]=b; g_VRSmokeCigPos[2]=c;
+                                    g_VRSmokeCigRot[0]=d; g_VRSmokeCigRot[1]=e; g_VRSmokeCigRot[2]=g; g_VRSmokeCigRot[3]=h;
+                                    cigLoaded = true;
+                                }
+                            }
+                        } else if (tag == "K") {
+                            if (iss >> a >> b >> c >> d) {
+                                g_VRSmokeThumbFlickL[0]=a; g_VRSmokeThumbFlickL[1]=b;
+                                g_VRSmokeThumbFlickL[2]=c; g_VRSmokeThumbFlickL[3]=d;
+                            }
+                        }
+                    }
+                }
+                if (rFing > 0)    g_VRSmokeFingerHave  = 1;
+                if (lFing > 0)    g_VRSmokeFingerHaveL = 1;
+                if (cigLoaded)    g_VRSmokeCigHave     = 1;
+                if (ltrLoaded)    g_VRSmokeLighterHave = 1;
+                // THIRD file: LEFT-hand CIGARETTE grip (CyberpunkVR_SmokeGrip_Left.ini) -> LC buffer.
+                // Same left finger bones as the lighter, different pose. Seed LC from the lighter pose
+                // so any bone the file omits (or a missing file) falls back to the lighter hold.
+                {
+                    for (int k = 0; k < 32; ++k) {
+                        g_VRSmokeFingerRotLC[k][0]=g_VRSmokeFingerRotL[k][0]; g_VRSmokeFingerRotLC[k][1]=g_VRSmokeFingerRotL[k][1];
+                        g_VRSmokeFingerRotLC[k][2]=g_VRSmokeFingerRotL[k][2]; g_VRSmokeFingerRotLC[k][3]=g_VRSmokeFingerRotL[k][3];
+                    }
+                    g_VRSmokeCigLPos[0]=g_VRSmokeLighterPos[0]; g_VRSmokeCigLPos[1]=g_VRSmokeLighterPos[1]; g_VRSmokeCigLPos[2]=g_VRSmokeLighterPos[2];
+                    g_VRSmokeCigLRot[0]=g_VRSmokeLighterRot[0]; g_VRSmokeCigLRot[1]=g_VRSmokeLighterRot[1]; g_VRSmokeCigLRot[2]=g_VRSmokeLighterRot[2]; g_VRSmokeCigLRot[3]=g_VRSmokeLighterRot[3];
+                    if (ltrLoaded) g_VRSmokeCigLHave = 1;   // fallback availability = lighter pose
+                    std::ifstream fc(VRDiagPath("CyberpunkVR_SmokeGrip_Left.ini"));
+                    if (fc.is_open()) {
+                        int lcFing = 0; bool lcSlot = false;
+                        std::string line;
+                        while (std::getline(fc, line)) {
+                            if (line.empty() || line[0] == '#') continue;
+                            std::istringstream iss(line);
+                            iss.imbue(std::locale::classic());
+                            std::string tag, nm;
+                            if (!(iss >> tag >> nm)) continue;
+                            float a=0,b=0,c=0,d=0,e=0,g2=0,h=0;
+                            if (tag == "F") {
+                                if (iss >> a >> b >> c >> d) {
+                                    for (int k = 0; k < g_VRSmokeFingerCountL && k < 32; ++k) {
+                                        if (EqualsInsensitive(g_VRSmokeFingerNameL[k], nm.c_str())) {
+                                            g_VRSmokeFingerRotLC[k][0]=a; g_VRSmokeFingerRotLC[k][1]=b;
+                                            g_VRSmokeFingerRotLC[k][2]=c; g_VRSmokeFingerRotLC[k][3]=d;
+                                            ++lcFing; break;
+                                        }
+                                    }
+                                }
+                            } else if (tag == "C") {
+                                if (iss >> a >> b >> c >> d >> e >> g2 >> h) {
+                                    g_VRSmokeCigLPos[0]=a; g_VRSmokeCigLPos[1]=b; g_VRSmokeCigLPos[2]=c;
+                                    g_VRSmokeCigLRot[0]=d; g_VRSmokeCigLRot[1]=e; g_VRSmokeCigLRot[2]=g2; g_VRSmokeCigLRot[3]=h;
+                                    lcSlot = true;
+                                }
+                            }
+                        }
+                        if (lcFing > 0 || lcSlot) g_VRSmokeCigLHave = 1;
+                    }
+                }
+                {   // diag: confirm how many lines actually parsed+matched from the .ini
+                    std::ofstream dbg(VRDiagPath("CyberpunkVR_SmokeGrip_loadinfo.txt"), std::ios::trunc);
+                    if (dbg.is_open())
+                        dbg << "resolvedR=" << g_VRSmokeFingerCount << " resolvedL=" << g_VRSmokeFingerCountL
+                            << " loadedR=" << rFing << " loadedL=" << lFing
+                            << " cig=" << (cigLoaded ? 1 : 0) << " lighter=" << (ltrLoaded ? 1 : 0) << "\n";
+                }
+            }
+
             // Copy the parent-index table so the pose hook can run FK each frame.
             const uint32_t pc = metaRig->parentIndeces.Size();
             const uint32_t copyN = (pc < boneCount ? pc : boneCount);
             int written = 0;
-            for (uint32_t i = 0; i < copyN && i < 256; ++i) { g_VRBoneParent[i] = metaRig->parentIndeces[i]; ++written; }
+            for (uint32_t i = 0; i < copyN && i < 800; ++i) { g_VRBoneParent[i] = metaRig->parentIndeces[i]; ++written; }
             g_VRBoneCount = written;
 
             // PERF (audit, session 3): per-solve FK used to walk the FULL rig (up to
@@ -4611,6 +4902,468 @@ void DumpPlayerBoneNames(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* a
         }
     }
     if (aOut) *aOut = static_cast<int32_t>(n);
+}
+
+// SMOKE FINGER-HOLD controls (see g_VRSmokeFinger* + the block in Hooked_AnimPoseApply).
+// SetVRSmokeFingers(active): 1 = replay the captured finger curl every player pose pass
+// (fingers close around the cigarette; VRIK still drives the wrist to the controller),
+// 0 = release. Returns the active state.
+void SetVRSmokeFingers(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    int32_t active = 0;
+    RED4ext::GetParameter(aFrame, &active);
+    aFrame->code++;
+    g_VRSmokeFingerActive = active ? 1 : 0;
+    if (aOut) *aOut = g_VRSmokeFingerActive;
+}
+
+// VRSmokeCaptureFingers(): latch the current right-hand finger locals on the next player
+// pose pass (call while the vanilla hold-cigarette workspot plays via AMM, fingers curled).
+// Returns the resolved finger-bone count (>0 confirms the capture is armed; 0 = bones not
+// resolved yet, enter VR / spawn the player first).
+void VRSmokeCaptureFingers(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    aFrame->code++;
+    g_VRSmokeFingerCapture = 1;
+    if (aOut) *aOut = g_VRSmokeFingerCount;
+}
+
+// VRSmokeDumpFingers(): write the captured grip pose to CyberpunkVR_SmokeGrip.ini (next to
+// the game exe). Name-keyed lines, so it reloads on the player skeleton regardless of index.
+// The live cig nudge (SetVRSmokeCigOffset) is BAKED into the saved cig transform, so reloading
+// (with the nudge reset) reproduces exactly what you tuned. Returns the number of lines written.
+void VRSmokeDumpFingers(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    aFrame->code++;
+    // Force '.' decimals for the whole dump regardless of the process/thread CRT locale, so the
+    // file always round-trips (the loader parses '.' via classic() locale). Per-thread scope.
+    _configthreadlocale(_ENABLE_PER_THREAD_LOCALE);
+    const char* prevNum = std::setlocale(LC_NUMERIC, nullptr);
+    std::string savedNum = prevNum ? prevNum : "C";
+    std::setlocale(LC_NUMERIC, "C");
+    int written = 0;
+    char buf[256];
+    // RIGHT hand (cigarette) -> CyberpunkVR_SmokeGrip_right.ini
+    if (g_VRSmokeFingerHave || g_VRSmokeCigHave) {
+        std::ofstream f(VRDiagPath("CyberpunkVR_SmokeGrip_right.ini"), std::ios::trunc);
+        if (f.is_open()) {
+            f << "# CyberpunkVR RIGHT-hand cigarette grip v1 (auto-generated by VRSmokeDumpFingers)\n";
+            f << "# F <bone> qx qy qz qw    |    C WeaponRight px py pz qx qy qz qw\n";
+            if (g_VRSmokeFingerHave) for (int k = 0; k < g_VRSmokeFingerCount && k < 32; ++k) {
+                if (g_VRSmokeFingerName[k][0] == '\0') continue;
+                std::snprintf(buf, sizeof(buf), "F %s %.9g %.9g %.9g %.9g\n",
+                    g_VRSmokeFingerName[k],
+                    g_VRSmokeFingerRot[k][0], g_VRSmokeFingerRot[k][1],
+                    g_VRSmokeFingerRot[k][2], g_VRSmokeFingerRot[k][3]);
+                f << buf; ++written;
+            }
+            if (g_VRSmokeCigHave && g_VRSmokeCigIdx >= 0) {
+                const float pos[3] = { g_VRSmokeCigPos[0]+g_VRSmokeCigOffP[0],
+                                       g_VRSmokeCigPos[1]+g_VRSmokeCigOffP[1],
+                                       g_VRSmokeCigPos[2]+g_VRSmokeCigOffP[2] };
+                const float base[4] = { g_VRSmokeCigRot[0], g_VRSmokeCigRot[1], g_VRSmokeCigRot[2], g_VRSmokeCigRot[3] };
+                const float off[4]  = { g_VRSmokeCigOffQ[0], g_VRSmokeCigOffQ[1], g_VRSmokeCigOffQ[2], g_VRSmokeCigOffQ[3] };
+                float rot[4]; VRIK_QuatMul(base, off, rot); VRIK_QuatNorm(rot);
+                std::snprintf(buf, sizeof(buf), "C WeaponRight %.9g %.9g %.9g %.9g %.9g %.9g %.9g\n",
+                    pos[0], pos[1], pos[2], rot[0], rot[1], rot[2], rot[3]);
+                f << buf; ++written;
+            }
+        }
+    }
+    // LEFT hand (lighter) -> CyberpunkVR_LighterGrip_Left.ini
+    if (g_VRSmokeFingerHaveL || g_VRSmokeLighterHave) {
+        std::ofstream f(VRDiagPath("CyberpunkVR_LighterGrip_Left.ini"), std::ios::trunc);
+        if (f.is_open()) {
+            f << "# CyberpunkVR LEFT-hand lighter grip v1 (auto-generated by VRSmokeDumpFingers)\n";
+            f << "# F <bone> qx qy qz qw | C WeaponLeft px py pz qx qy qz qw | K LeftThumbFlick qx qy qz qw\n";
+            if (g_VRSmokeFingerHaveL) for (int k = 0; k < g_VRSmokeFingerCountL && k < 32; ++k) {
+                if (g_VRSmokeFingerNameL[k][0] == '\0') continue;
+                std::snprintf(buf, sizeof(buf), "F %s %.9g %.9g %.9g %.9g\n",
+                    g_VRSmokeFingerNameL[k],
+                    g_VRSmokeFingerRotL[k][0], g_VRSmokeFingerRotL[k][1],
+                    g_VRSmokeFingerRotL[k][2], g_VRSmokeFingerRotL[k][3]);
+                f << buf; ++written;
+            }
+            if (g_VRSmokeLighterHave && g_VRSmokeLighterIdx >= 0) {
+                const float pos[3] = { g_VRSmokeLighterPos[0]+g_VRSmokeLighterOffP[0],
+                                       g_VRSmokeLighterPos[1]+g_VRSmokeLighterOffP[1],
+                                       g_VRSmokeLighterPos[2]+g_VRSmokeLighterOffP[2] };
+                const float base[4] = { g_VRSmokeLighterRot[0], g_VRSmokeLighterRot[1], g_VRSmokeLighterRot[2], g_VRSmokeLighterRot[3] };
+                const float off[4]  = { g_VRSmokeLighterOffQ[0], g_VRSmokeLighterOffQ[1], g_VRSmokeLighterOffQ[2], g_VRSmokeLighterOffQ[3] };
+                float rot[4]; VRIK_QuatMul(base, off, rot); VRIK_QuatNorm(rot);
+                std::snprintf(buf, sizeof(buf), "C WeaponLeft %.9g %.9g %.9g %.9g %.9g %.9g %.9g\n",
+                    pos[0], pos[1], pos[2], rot[0], rot[1], rot[2], rot[3]);
+                f << buf; ++written;
+            }
+            if (g_VRSmokeFingerHaveL) {
+                std::snprintf(buf, sizeof(buf), "K LeftThumbFlick %.9g %.9g %.9g %.9g\n",
+                    g_VRSmokeThumbFlickL[0], g_VRSmokeThumbFlickL[1], g_VRSmokeThumbFlickL[2], g_VRSmokeThumbFlickL[3]);
+                f << buf; ++written;
+            }
+        }
+    }
+    // LEFT hand (CIGARETTE) -> CyberpunkVR_SmokeGrip_Left.ini (separate hold for the cig in the left hand)
+    if (g_VRSmokeCigLHave) {
+        std::ofstream f(VRDiagPath("CyberpunkVR_SmokeGrip_Left.ini"), std::ios::trunc);
+        if (f.is_open()) {
+            f << "# CyberpunkVR LEFT-hand cigarette grip v1 (auto-generated by VRSmokeDumpFingers)\n";
+            f << "# F <bone> qx qy qz qw | C WeaponLeft px py pz qx qy qz qw\n";
+            for (int k = 0; k < g_VRSmokeFingerCountL && k < 32; ++k) {
+                if (g_VRSmokeFingerNameL[k][0] == '\0') continue;
+                std::snprintf(buf, sizeof(buf), "F %s %.9g %.9g %.9g %.9g\n",
+                    g_VRSmokeFingerNameL[k],
+                    g_VRSmokeFingerRotLC[k][0], g_VRSmokeFingerRotLC[k][1],
+                    g_VRSmokeFingerRotLC[k][2], g_VRSmokeFingerRotLC[k][3]);
+                f << buf; ++written;
+            }
+            if (g_VRSmokeLighterIdx >= 0) {
+                std::snprintf(buf, sizeof(buf), "C WeaponLeft %.9g %.9g %.9g %.9g %.9g %.9g %.9g\n",
+                    g_VRSmokeCigLPos[0], g_VRSmokeCigLPos[1], g_VRSmokeCigLPos[2],
+                    g_VRSmokeCigLRot[0], g_VRSmokeCigLRot[1], g_VRSmokeCigLRot[2], g_VRSmokeCigLRot[3]);
+                f << buf; ++written;
+            }
+        }
+    }
+    std::setlocale(LC_NUMERIC, savedNum.c_str());
+    if (aOut) *aOut = written;
+}
+
+// SetVRSmokeCig(enable): 1 = also place the WeaponRight (cig) slot when the grip is applied,
+// 0 = leave it alone (fingers-only, in case the captured slot transform looks wrong).
+void SetVRSmokeCig(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    int32_t en = 1;
+    RED4ext::GetParameter(aFrame, &en);
+    aFrame->code++;
+    g_VRSmokeCigEnable = en ? 1 : 0;
+    if (aOut) *aOut = g_VRSmokeCigEnable;
+}
+
+// VRSmokeMouthDist(): model-space distance from the cig slot to the mouth, computed in the VRIK
+// body solve (tracks HMD + controller). redscript uses this for the inhale/put-in-mouth gesture
+// instead of the FPP camera, whose world position ignores HMD positional/lean tracking in VR.
+void VRSmokeMouthDist(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    aFrame->code++;
+    if (aOut) *aOut = g_VRSmokeMouthDist;
+}
+
+// VRSmokeMouthDistL(): same as VRSmokeMouthDist but for the LEFT hand (left controller <-> mouth).
+// Lets redscript gate the LEFT grip on the LEFT hand being at the lips, so raising the LEFT hand to
+// the mouth (with the right hand down) still toggles the cig.
+void VRSmokeMouthDistL(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    aFrame->code++;
+    if (aOut) *aOut = g_VRSmokeMouthDistL;
+}
+
+// SetVRSmokeCigOffset(x,y,z,pitch,yaw,roll): live nudge of the cig in the hand (bone-local
+// metres + degrees) for tuning in VR. Bake it with VRSmokeDumpFingers when it looks right.
+void SetVRSmokeCigOffset(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    float x=0.0f, y=0.0f, z=0.0f, pitch=0.0f, yaw=0.0f, roll=0.0f;
+    RED4ext::GetParameter(aFrame, &x);
+    RED4ext::GetParameter(aFrame, &y);
+    RED4ext::GetParameter(aFrame, &z);
+    RED4ext::GetParameter(aFrame, &pitch);
+    RED4ext::GetParameter(aFrame, &yaw);
+    RED4ext::GetParameter(aFrame, &roll);
+    aFrame->code++;
+    g_VRSmokeCigOffP[0]=x; g_VRSmokeCigOffP[1]=y; g_VRSmokeCigOffP[2]=z;
+    const float d2r = 0.01745329252f * 0.5f;
+    float cp = std::cos(pitch*d2r), sp = std::sin(pitch*d2r);
+    float cy = std::cos(yaw*d2r),   sy = std::sin(yaw*d2r);
+    float cr = std::cos(roll*d2r),  sr = std::sin(roll*d2r);
+    g_VRSmokeCigOffQ[0] = sp*cy*cr + cp*sy*sr;
+    g_VRSmokeCigOffQ[1] = cp*sy*cr - sp*cy*sr;
+    g_VRSmokeCigOffQ[2] = cp*cy*sr + sp*sy*cr;
+    g_VRSmokeCigOffQ[3] = cp*cy*cr - sp*sy*sr;
+    if (aOut) *aOut = 1;
+}
+
+// VRSmokeMouthWorldPos(): world mouth point for the exhale smoke (W = 1 valid / 0 not). Tracks the
+// real HMD via the same view pose the cig anchor uses.
+void VRSmokeMouthWorldPos(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, RED4ext::Vector4* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    aFrame->code++;
+    if (aOut) {
+        aOut->X = g_VRSmokeMouthWorldPos[0];
+        aOut->Y = g_VRSmokeMouthWorldPos[1];
+        aOut->Z = g_VRSmokeMouthWorldPos[2];
+        aOut->W = static_cast<float>(g_VRSmokeMouthWorldValid);
+    }
+}
+
+// VRSmokeMouthWorldRot(): world orientation for the exhale smoke (view pose * smoke offset rot).
+void VRSmokeMouthWorldRot(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, RED4ext::Quaternion* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    aFrame->code++;
+    if (aOut) {
+        aOut->i = g_VRSmokeMouthWorldRot[0];
+        aOut->j = g_VRSmokeMouthWorldRot[1];
+        aOut->k = g_VRSmokeMouthWorldRot[2];
+        aOut->r = g_VRSmokeMouthWorldRot[3];
+    }
+}
+
+// SetVRSmokeSmokeOffset(x,y,z,pitch,yaw,roll): live tune of the exhale smoke -- HMD-local position
+// (x=right, y=forward, z=up, m) and orientation (deg), independent of the cig mouth anchor.
+void SetVRSmokeSmokeOffset(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    float x=0.0f, y=0.0f, z=0.0f, pitch=0.0f, yaw=0.0f, roll=0.0f;
+    RED4ext::GetParameter(aFrame, &x); RED4ext::GetParameter(aFrame, &y); RED4ext::GetParameter(aFrame, &z);
+    RED4ext::GetParameter(aFrame, &pitch); RED4ext::GetParameter(aFrame, &yaw); RED4ext::GetParameter(aFrame, &roll);
+    aFrame->code++;
+    g_VRSmokeSmokePos[0]=x; g_VRSmokeSmokePos[1]=y; g_VRSmokeSmokePos[2]=z;
+    const float d2r = 0.01745329252f * 0.5f;
+    float cp = std::cos(pitch*d2r), sp = std::sin(pitch*d2r);
+    float cy = std::cos(yaw*d2r),   sy = std::sin(yaw*d2r);
+    float cr = std::cos(roll*d2r),  sr = std::sin(roll*d2r);
+    g_VRSmokeSmokeRot[0] = sp*cy*cr + cp*sy*sr;
+    g_VRSmokeSmokeRot[1] = cp*sy*cr - sp*cy*sr;
+    g_VRSmokeSmokeRot[2] = cp*cy*sr + sp*sy*cr;
+    g_VRSmokeSmokeRot[3] = cp*cy*cr - sp*sy*sr;
+    if (aOut) *aOut = 1;
+}
+
+// SetVRSmokeCigScaleY(y): burn-down -- Y (long-axis) scale of the cig slot bone, 1.0 = full length.
+void SetVRSmokeCigScaleY(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    float y = 1.0f;
+    RED4ext::GetParameter(aFrame, &y);
+    aFrame->code++;
+    if (y < 0.02f) y = 0.02f;
+    g_VRSmokeCigScaleY = y;
+    if (aOut) *aOut = 1;
+}
+
+// SetVRSmokeCigChunks(cig, count): burn-down EXPERIMENT via chunk hiding. Shows only the low `count`
+// mesh chunks of the cig entity (count<=0 or >=64 -> all chunks). Returns the number of mesh
+// components touched. If the cig mesh's chunks are ordered along its length, lowering `count`
+// shortens it; test live from the console to learn the ordering.
+void SetVRSmokeCigChunks(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    RED4ext::Handle<RED4ext::IScriptable> ent;
+    RED4ext::GetParameter(aFrame, &ent);
+    int32_t count = 0;
+    RED4ext::GetParameter(aFrame, &count);
+    aFrame->code++;
+    const uint64_t mask = (count <= 0 || count >= 64) ? 0xFFFFFFFFFFFFFFFFull : ((1ull << count) - 1ull);
+    auto* entity = reinterpret_cast<RED4ext::ent::Entity*>(ent.instance);
+    if (!entity) { if (aOut) *aOut = -1; return; }
+    const RED4ext::CName skinnedName("entSkinnedMeshComponent");
+    const RED4ext::CName garmentName("entGarmentSkinnedMeshComponent");
+    const RED4ext::CName meshName("entMeshComponent");
+    int32_t hit = 0;
+    for (auto& componentHandle : entity->components) {
+        auto* component = componentHandle.instance;
+        if (!component) continue;
+        RED4ext::CClass* type = component->GetType();
+        if (!type) continue;
+        if (ClassIsA(type, skinnedName) || ClassIsA(type, garmentName)) {
+            reinterpret_cast<RED4ext::ent::SkinnedMeshComponent*>(component)->chunkMask = mask; ++hit;
+        } else if (ClassIsA(type, meshName)) {
+            reinterpret_cast<RED4ext::ent::MeshComponent*>(component)->chunkMask = mask; ++hit;
+        }
+    }
+    if (aOut) *aOut = hit;
+}
+
+// SetVRSmokeCigVisualScale(cig, y): burn-down for a STATIC-mesh cig. Sets visualScale.Y (length axis)
+// on every entMeshComponent of the cig entity; keeps X/Z. Returns the number of mesh components hit
+// (0 = the cig is still a skinned mesh / override archive not loaded). If the cig shrinks along the
+// wrong axis in-game, switch .Y to .X or .Z here.
+void SetVRSmokeCigVisualScale(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    RED4ext::Handle<RED4ext::IScriptable> ent;
+    RED4ext::GetParameter(aFrame, &ent);
+    float y = 1.0f;
+    RED4ext::GetParameter(aFrame, &y);
+    aFrame->code++;
+    if (y < 0.02f) y = 0.02f;
+    auto* entity = reinterpret_cast<RED4ext::ent::Entity*>(ent.instance);
+    if (!entity) { if (aOut) *aOut = -1; return; }
+    const RED4ext::CName meshName("entMeshComponent");
+    int32_t hit = 0;
+    for (auto& componentHandle : entity->components) {
+        auto* component = componentHandle.instance;
+        if (!component) continue;
+        RED4ext::CClass* type = component->GetType();
+        if (!type) continue;
+        if (ClassIsA(type, meshName)) {
+            reinterpret_cast<RED4ext::ent::MeshComponent*>(component)->visualScale.Y = y;
+            ++hit;
+        }
+    }
+    if (aOut) *aOut = hit;
+}
+
+// GetVRSmokeCigVisualScaleY(cig): current visualScale.Y of the cig's first entMeshComponent (the .ent
+// default before we shrink it), or -1 if none. reds reads this once to learn the authored full length.
+void GetVRSmokeCigVisualScaleY(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    RED4ext::Handle<RED4ext::IScriptable> ent;
+    RED4ext::GetParameter(aFrame, &ent);
+    aFrame->code++;
+    float result = -1.0f;
+    auto* entity = reinterpret_cast<RED4ext::ent::Entity*>(ent.instance);
+    if (entity) {
+        const RED4ext::CName meshName("entMeshComponent");
+        for (auto& componentHandle : entity->components) {
+            auto* component = componentHandle.instance;
+            if (!component) continue;
+            RED4ext::CClass* type = component->GetType();
+            if (!type) continue;
+            if (ClassIsA(type, meshName)) {
+                result = reinterpret_cast<RED4ext::ent::MeshComponent*>(component)->visualScale.Y;
+                break;
+            }
+        }
+    }
+    if (aOut) *aOut = result;
+}
+
+// SetVRSmokeMouthAnchor(on): 1 = pin the cig to the mouth (hands-free), 0 = back to the hand grip.
+void SetVRSmokeMouthAnchor(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    int32_t on = 0;
+    RED4ext::GetParameter(aFrame, &on);
+    aFrame->code++;
+    g_VRSmokeMouthAnchor = on ? 1 : 0;
+    if (!g_VRSmokeMouthAnchor) { g_VRSmokeAnchorValid = 0; g_VRSmokeAltAnchorValid = 0; } // revert next pass
+    if (aOut) *aOut = g_VRSmokeMouthAnchor;
+}
+
+// SetVRSmokeAnchorBone(sel): choose which bone the mouth-pin drives, so a prop on a NON-weapon slot
+// can ride the lips with BOTH hands + weapon slots free. 0=off (WeaponRight path), 1=Neck1, 2=Head,
+// 3=Neck. The bone is pinned to the HMD mouth via its parent's model FK (see vrik_hook.h).
+void SetVRSmokeAnchorBone(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    int32_t sel = 0;
+    RED4ext::GetParameter(aFrame, &sel);
+    aFrame->code++;
+    g_VRSmokeAnchorBoneSel = sel;
+    if (sel == 0) { g_VRSmokeAnchorBoneIdx = -1; g_VRSmokeAltAnchorValid = 0; }
+    if (aOut) *aOut = sel;
+}
+
+// SetVRSmokeMouthOffset(x,y,z,pitch,yaw,roll): live tune of the mouth-anchored cig. x,y,z = model-space
+// position offset from the head bone (metres, +Y forward, +Z up); pitch/yaw/roll = the cig's model-space
+// orientation at the lips (degrees). Adjust from the CET console until the cig sits right in VR.
+void SetVRSmokeMouthOffset(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    float x=0.0f, y=0.0f, z=0.0f, pitch=0.0f, yaw=0.0f, roll=0.0f;
+    RED4ext::GetParameter(aFrame, &x);
+    RED4ext::GetParameter(aFrame, &y);
+    RED4ext::GetParameter(aFrame, &z);
+    RED4ext::GetParameter(aFrame, &pitch);
+    RED4ext::GetParameter(aFrame, &yaw);
+    RED4ext::GetParameter(aFrame, &roll);
+    aFrame->code++;
+    g_VRSmokeMouthPos[0]=x; g_VRSmokeMouthPos[1]=y; g_VRSmokeMouthPos[2]=z;
+    const float d2r = 0.01745329252f * 0.5f;
+    float cp = std::cos(pitch*d2r), sp = std::sin(pitch*d2r);
+    float cy = std::cos(yaw*d2r),   sy = std::sin(yaw*d2r);
+    float cr = std::cos(roll*d2r),  sr = std::sin(roll*d2r);
+    g_VRSmokeMouthRot[0] = sp*cy*cr + cp*sy*sr;
+    g_VRSmokeMouthRot[1] = cp*sy*cr - sp*cy*sr;
+    g_VRSmokeMouthRot[2] = cp*cy*sr + sp*sy*cr;
+    g_VRSmokeMouthRot[3] = cp*cy*cr - sp*sy*sr;
+    if (aOut) *aOut = 1;
+}
+
+// ---- LEFT-HAND mirror natives (lighter grip) ----
+void SetVRSmokeFingersL(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    int32_t active = 0;
+    RED4ext::GetParameter(aFrame, &active);
+    aFrame->code++;
+    g_VRSmokeFingerActiveL = active ? 1 : 0;
+    if (aOut) *aOut = g_VRSmokeFingerActiveL;
+}
+
+// SetVRSmokeLeftCig(on): 1 = the LEFT hand holds the CIGARETTE (apply the cig-left pose from
+// CyberpunkVR_SmokeGrip_Left.ini); 0 = the LEFT hand holds the lighter (apply the lighter pose).
+// reds sets this when the cig enters / leaves the left hand. Also routes the left-hand capture:
+// with on=1, VRSmokeCaptureFingersL + VRSmokeDumpFingers record the cig-left pose.
+void SetVRSmokeLeftCig(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    int32_t on = 0;
+    RED4ext::GetParameter(aFrame, &on);
+    aFrame->code++;
+    g_VRSmokeLeftUseCig = on ? 1 : 0;
+    if (aOut) *aOut = g_VRSmokeLeftUseCig;
+}
+
+void VRSmokeCaptureFingersL(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    aFrame->code++;
+    g_VRSmokeFingerCaptureL = 1;
+    if (aOut) *aOut = g_VRSmokeFingerCountL;
+}
+
+void SetVRSmokeLighter(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    int32_t en = 1;
+    RED4ext::GetParameter(aFrame, &en);
+    aFrame->code++;
+    g_VRSmokeLighterEnable = en ? 1 : 0;
+    if (aOut) *aOut = g_VRSmokeLighterEnable;
+}
+
+void SetVRSmokeLighterOffset(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    float x=0.0f, y=0.0f, z=0.0f, pitch=0.0f, yaw=0.0f, roll=0.0f;
+    RED4ext::GetParameter(aFrame, &x);
+    RED4ext::GetParameter(aFrame, &y);
+    RED4ext::GetParameter(aFrame, &z);
+    RED4ext::GetParameter(aFrame, &pitch);
+    RED4ext::GetParameter(aFrame, &yaw);
+    RED4ext::GetParameter(aFrame, &roll);
+    aFrame->code++;
+    g_VRSmokeLighterOffP[0]=x; g_VRSmokeLighterOffP[1]=y; g_VRSmokeLighterOffP[2]=z;
+    const float d2r = 0.01745329252f * 0.5f;
+    float cp = std::cos(pitch*d2r), sp = std::sin(pitch*d2r);
+    float cy = std::cos(yaw*d2r),   sy = std::sin(yaw*d2r);
+    float cr = std::cos(roll*d2r),  sr = std::sin(roll*d2r);
+    g_VRSmokeLighterOffQ[0] = sp*cy*cr + cp*sy*sr;
+    g_VRSmokeLighterOffQ[1] = cp*sy*cr - sp*cy*sr;
+    g_VRSmokeLighterOffQ[2] = cp*cy*sr + sp*sy*cr;
+    g_VRSmokeLighterOffQ[3] = cp*cy*cr - sp*sy*sr;
+    if (aOut) *aOut = 1;
+}
+
+// SetVRSmokeThumbFlickL(pitch,yaw,roll): the FULL-press rotation delta for the left thumb
+// (the "press the lighter wheel" motion at trigger = 1). Tune in VR, then bake via dump.
+void SetVRSmokeThumbFlickL(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    float pitch=0.0f, yaw=0.0f, roll=0.0f;
+    RED4ext::GetParameter(aFrame, &pitch);
+    RED4ext::GetParameter(aFrame, &yaw);
+    RED4ext::GetParameter(aFrame, &roll);
+    aFrame->code++;
+    const float d2r = 0.01745329252f * 0.5f;
+    float cp = std::cos(pitch*d2r), sp = std::sin(pitch*d2r);
+    float cy = std::cos(yaw*d2r),   sy = std::sin(yaw*d2r);
+    float cr = std::cos(roll*d2r),  sr = std::sin(roll*d2r);
+    g_VRSmokeThumbFlickL[0] = sp*cy*cr + cp*sy*sr;
+    g_VRSmokeThumbFlickL[1] = cp*sy*cr - sp*cy*sr;
+    g_VRSmokeThumbFlickL[2] = cp*cy*sr + sp*sy*cr;
+    g_VRSmokeThumbFlickL[3] = cp*cy*cr - sp*sy*sr;
+    if (aOut) *aOut = 1;
+}
+
+// SetVRSmokeThumbPressL(amount): manual press override (0..1) for tuning without the trigger.
+// The live left trigger (shared[67]) still drives it; the larger of the two wins. Set 0 to
+// hand control back to the trigger.
+void SetVRSmokeThumbPressL(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    float amt = 0.0f;
+    RED4ext::GetParameter(aFrame, &amt);
+    aFrame->code++;
+    if (amt < 0.0f) amt = 0.0f; else if (amt > 1.0f) amt = 1.0f;
+    g_VRSmokeThumbPressManualL = amt;
+    if (aOut) *aOut = 1;
 }
 
 // VR Transform data from Lua (Camera and Player Model Space)
@@ -5928,6 +6681,41 @@ static const char*   kProvNames[kProvNCls] = {
 static uintptr_t g_provVtbl[kProvNCls] = {0};
 static void*     g_provOrig[kProvNCls][kProvNSlots] = {0};
 volatile uint64_t g_provCalls[kProvNCls][kProvNSlots] = {0};
+// The last 16 bytes each slot handed back. The launch ORIENTATION was found by testing for a unit
+// quaternion; the launch ORIGIN is findable the same way and for the same reason -- a world
+// position in Night City is thousands of metres out, which nothing else in these buffers is. One
+// run of the census names the slot instead of another guess.
+volatile float    g_provLastOut[kProvNCls][kProvNSlots][4] = {};
+volatile uint8_t  g_provOutSeen[kProvNCls][kProvNSlots] = {};
+
+extern volatile float    g_provMuzzlePos[3];      // defined with the other muzzle state below
+extern volatile uint32_t g_provMuzzlePosSeq;
+
+static void DumpProviderSlots(std::ofstream& out) {
+    // Which provider slot carries the launch ORIGIN. Classified by content, not by position in
+    // the table: a unit quaternion is an orientation, three components of a thousand metres or
+    // more are a world position, and everything else is neither.
+    out << "PROVIDER SLOTS (realSlot = " << kProvSlotLo << " + index)\n";
+    out << "  muzzlePos=(" << g_provMuzzlePos[0] << ", " << g_provMuzzlePos[1] << ", "
+        << g_provMuzzlePos[2] << ") seq=" << g_provMuzzlePosSeq << "\n";
+    for (int c = 0; c < kProvNCls; ++c) {
+        for (int sl = 0; sl < kProvNSlots; ++sl) {
+            if (!g_provCalls[c][sl] || !g_provOutSeen[c][sl]) continue;
+            const float a0 = g_provLastOut[c][sl][0], a1 = g_provLastOut[c][sl][1];
+            const float a2 = g_provLastOut[c][sl][2], a3 = g_provLastOut[c][sl][3];
+            const float n = a0*a0 + a1*a1 + a2*a2 + a3*a3;
+            const float big = (std::fabs(a0) > 100.0f) + (std::fabs(a1) > 100.0f)
+                            + (std::fabs(a2) > 100.0f);
+            const char* tag = (n > 0.9f && n < 1.1f) ? "QUAT"
+                            : (big >= 2.0f)          ? "WORLDPOS"
+                                                     : "-";
+            out << "  C" << c << " S" << sl << " (slot " << (kProvSlotLo + sl) << ") "
+                << tag << " calls=" << g_provCalls[c][sl]
+                << " out=(" << a0 << ", " << a1 << ", " << a2 << ", " << a3 << ")\n";
+        }
+    }
+}
+
 volatile int      g_provOverrideCls  = -1;
 volatile int      g_provOverrideSlot = -1; // (cls,slot) whose stub overwrites the out-quat
 volatile uint64_t g_provOverrides = 0;
@@ -5936,6 +6724,17 @@ volatile float    g_provOrigQ[4] = {0,0,0,1};   // provider's ORIGINAL out-quat 
 volatile float    g_provCtrlQ[4] = {0,0,0,1};   // controller quat shared[12..15] captured at the same call
 volatile float    g_provHmdQ[4]  = {0,0,0,1};   // hmd quat shared[16..19] captured at the same call
 volatile float    g_provMuzzleQ[4] = {0,0,0,1}; // weapon muzzle WORLD orientation (CET publishes it)
+// The muzzle WORLD POSITION. The launch override has always replaced the shot's direction with
+// this muzzle's orientation while leaving its ORIGIN at the game camera -- which is the left eye,
+// because MAIN is both the gameplay camera and the left render camera. The bullet therefore flew
+// parallel to the barrel but started 65 mm away from the eye that was aiming, so the sight was
+// exact for the left eye and off by a constant 65 mm for the right. Measured: identical geometry
+// in both views, and a miss that does not change with range.
+// 1 = the aim ray starts at the muzzle instead of the head. Live switch, so the two can be
+// compared by shooting rather than by argument.
+volatile int      g_waXhPosFromMuzzle = 1;
+volatile float    g_provMuzzlePos[3] = {0,0,0};
+volatile uint32_t g_provMuzzlePosSeq = 0;
 volatile uint32_t g_provMuzzleSeq = 0;          // freshness
 volatile float    g_provDeltaQ[4] = {0,0,0,1};  // mode6 cone-rotation delta (recomputed per muzzle seq)
 volatile uint32_t g_provDeltaSeq = 0xFFFFFFFF;  // seq the delta was computed for
@@ -6000,6 +6799,11 @@ static uintptr_t __fastcall ProvStub(uintptr_t rcx, uintptr_t rdx, uintptr_t r8,
     if (IsReadable(outp, 16)) {
         __try {
             float* q = reinterpret_cast<float*>(outp);
+            // Record BEFORE the unit-quaternion test, so the slots that are not orientations --
+            // the one we are actually looking for -- get sampled too.
+            g_provLastOut[C][S][0] = q[0]; g_provLastOut[C][S][1] = q[1];
+            g_provLastOut[C][S][2] = q[2]; g_provLastOut[C][S][3] = q[3];
+            g_provOutSeen[C][S] = 1;
             float m = q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3];
             if (m > 0.9f && m < 1.1f) {  // unit quaternion -> this slot returns an orientation
                 g_provLastQ[0]=q[0]; g_provLastQ[1]=q[1]; g_provLastQ[2]=q[2]; g_provLastQ[3]=q[3];
@@ -6205,6 +7009,27 @@ void SetVRMuzzleQuat(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, void*,
 // Publish the current ADS/scope zoom factor to shared[28] so the dxgi overlay can scale the
 // barrel laser-dot's screen offset by it (the scope magnifies the image but the bullet still
 // leaves the barrel). CET pushes PlayerStateMachine.ZoomLevel each frame; 1.0 = no zoom.
+// Companion to SetVRMuzzleQuat: the same GetMuzzleSlotWorldTransform the CET weapon mod already
+// reads, minus the half it used to throw away.
+void SetVRMuzzlePos(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, void*, int64_t) {
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    RED4ext::GetParameter(aFrame, &x);
+    RED4ext::GetParameter(aFrame, &y);
+    RED4ext::GetParameter(aFrame, &z);
+    aFrame->code++;
+    // The transform returns WORLD coordinates on most frames and something local on others --
+    // measured alternating (3187.26, -376.40, 134.16) and (0.00, 0.29, 0.04) frame to frame.
+    // A local value is not a muzzle position and must not overwrite a good one: keep the last
+    // world-space sample instead, or the consumer flips between two answers every other frame.
+    if (x*x + y*y + z*z < 1.0f) return;
+    g_provMuzzlePos[0] = x; g_provMuzzlePos[1] = y; g_provMuzzlePos[2] = z;
+    ++g_provMuzzlePosSeq;
+    if (g_pSharedHands) {
+        g_pSharedHands[200] = x; g_pSharedHands[201] = y; g_pSharedHands[202] = z;
+        g_pSharedHands[203] = 1.0f;   // valid
+    }
+}
+
 void SetVRZoomLevel(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, void*, int64_t) {
     float z = 1.0f; RED4ext::GetParameter(aFrame, &z); aFrame->code++;
     if (g_pSharedHands) g_pSharedHands[28] = (z > 0.01f && z < 64.0f) ? z : 1.0f;
@@ -6362,6 +7187,95 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterTypes() {
 
     auto f15o = RED4ext::CGlobalFunction::Create("DumpPlayerBoneNames", "DumpPlayerBoneNames", &DumpPlayerBoneNames);
     f15o->flags = flags; f15o->SetReturnType("Int32"); rtti->RegisterFunction(f15o);
+
+    auto f15oSF = RED4ext::CGlobalFunction::Create("SetVRSmokeFingers", "SetVRSmokeFingers", &SetVRSmokeFingers);
+    f15oSF->flags = flags; f15oSF->SetReturnType("Int32"); f15oSF->AddParam("Int32", "active"); rtti->RegisterFunction(f15oSF);
+
+    auto f15oCF = RED4ext::CGlobalFunction::Create("VRSmokeCaptureFingers", "VRSmokeCaptureFingers", &VRSmokeCaptureFingers);
+    f15oCF->flags = flags; f15oCF->SetReturnType("Int32"); rtti->RegisterFunction(f15oCF);
+
+    auto f15oDF = RED4ext::CGlobalFunction::Create("VRSmokeDumpFingers", "VRSmokeDumpFingers", &VRSmokeDumpFingers);
+    f15oDF->flags = flags; f15oDF->SetReturnType("Int32"); rtti->RegisterFunction(f15oDF);
+
+    auto f15oCE = RED4ext::CGlobalFunction::Create("SetVRSmokeCig", "SetVRSmokeCig", &SetVRSmokeCig);
+    f15oCE->flags = flags; f15oCE->SetReturnType("Int32"); f15oCE->AddParam("Int32", "enable"); rtti->RegisterFunction(f15oCE);
+
+    auto f15oMD = RED4ext::CGlobalFunction::Create("VRSmokeMouthDist", "VRSmokeMouthDist", &VRSmokeMouthDist);
+    f15oMD->flags = flags; f15oMD->SetReturnType("Float"); rtti->RegisterFunction(f15oMD);
+
+    auto f15oMDL = RED4ext::CGlobalFunction::Create("VRSmokeMouthDistL", "VRSmokeMouthDistL", &VRSmokeMouthDistL);
+    f15oMDL->flags = flags; f15oMDL->SetReturnType("Float"); rtti->RegisterFunction(f15oMDL);
+
+    auto f15oAB = RED4ext::CGlobalFunction::Create("SetVRSmokeAnchorBone", "SetVRSmokeAnchorBone", &SetVRSmokeAnchorBone);
+    f15oAB->flags = flags; f15oAB->SetReturnType("Int32"); f15oAB->AddParam("Int32","sel"); rtti->RegisterFunction(f15oAB);
+    auto f15oMA = RED4ext::CGlobalFunction::Create("SetVRSmokeMouthAnchor", "SetVRSmokeMouthAnchor", &SetVRSmokeMouthAnchor);
+    f15oMA->flags = flags; f15oMA->SetReturnType("Int32"); f15oMA->AddParam("Int32", "on"); rtti->RegisterFunction(f15oMA);
+
+    auto f15oCS = RED4ext::CGlobalFunction::Create("SetVRSmokeCigScaleY", "SetVRSmokeCigScaleY", &SetVRSmokeCigScaleY);
+    f15oCS->flags = flags; f15oCS->SetReturnType("Int32"); f15oCS->AddParam("Float", "y"); rtti->RegisterFunction(f15oCS);
+
+    auto f15oMWP = RED4ext::CGlobalFunction::Create("VRSmokeMouthWorldPos", "VRSmokeMouthWorldPos", &VRSmokeMouthWorldPos);
+    f15oMWP->flags = flags; f15oMWP->SetReturnType("Vector4"); rtti->RegisterFunction(f15oMWP);
+    auto f15oMWF = RED4ext::CGlobalFunction::Create("VRSmokeMouthWorldRot", "VRSmokeMouthWorldRot", &VRSmokeMouthWorldRot);
+    f15oMWF->flags = flags; f15oMWF->SetReturnType("Quaternion"); rtti->RegisterFunction(f15oMWF);
+    auto f15oSO = RED4ext::CGlobalFunction::Create("SetVRSmokeSmokeOffset", "SetVRSmokeSmokeOffset", &SetVRSmokeSmokeOffset);
+    f15oSO->flags = flags; f15oSO->SetReturnType("Int32");
+    f15oSO->AddParam("Float","x"); f15oSO->AddParam("Float","y"); f15oSO->AddParam("Float","z");
+    f15oSO->AddParam("Float","pitch"); f15oSO->AddParam("Float","yaw"); f15oSO->AddParam("Float","roll");
+    rtti->RegisterFunction(f15oSO);
+
+    auto f15oCC = RED4ext::CGlobalFunction::Create("SetVRSmokeCigChunks", "SetVRSmokeCigChunks", &SetVRSmokeCigChunks);
+    f15oCC->flags = flags; f15oCC->SetReturnType("Int32");
+    f15oCC->AddParam("handle:GameObject", "cig"); f15oCC->AddParam("Int32", "count");
+    rtti->RegisterFunction(f15oCC);
+
+    auto f15oVS = RED4ext::CGlobalFunction::Create("SetVRSmokeCigVisualScale", "SetVRSmokeCigVisualScale", &SetVRSmokeCigVisualScale);
+    f15oVS->flags = flags; f15oVS->SetReturnType("Int32");
+    f15oVS->AddParam("handle:GameObject", "cig"); f15oVS->AddParam("Float", "y");
+    rtti->RegisterFunction(f15oVS);
+
+    auto f15oVG = RED4ext::CGlobalFunction::Create("GetVRSmokeCigVisualScaleY", "GetVRSmokeCigVisualScaleY", &GetVRSmokeCigVisualScaleY);
+    f15oVG->flags = flags; f15oVG->SetReturnType("Float");
+    f15oVG->AddParam("handle:GameObject", "cig");
+    rtti->RegisterFunction(f15oVG);
+
+    auto f15oMO = RED4ext::CGlobalFunction::Create("SetVRSmokeMouthOffset", "SetVRSmokeMouthOffset", &SetVRSmokeMouthOffset);
+    f15oMO->flags = flags; f15oMO->SetReturnType("Int32");
+    f15oMO->AddParam("Float", "x"); f15oMO->AddParam("Float", "y"); f15oMO->AddParam("Float", "z");
+    f15oMO->AddParam("Float", "pitch"); f15oMO->AddParam("Float", "yaw"); f15oMO->AddParam("Float", "roll");
+    rtti->RegisterFunction(f15oMO);
+
+    auto f15oCO = RED4ext::CGlobalFunction::Create("SetVRSmokeCigOffset", "SetVRSmokeCigOffset", &SetVRSmokeCigOffset);
+    f15oCO->flags = flags; f15oCO->SetReturnType("Int32");
+    f15oCO->AddParam("Float", "x"); f15oCO->AddParam("Float", "y"); f15oCO->AddParam("Float", "z");
+    f15oCO->AddParam("Float", "pitch"); f15oCO->AddParam("Float", "yaw"); f15oCO->AddParam("Float", "roll");
+    rtti->RegisterFunction(f15oCO);
+
+    auto f15oLF = RED4ext::CGlobalFunction::Create("SetVRSmokeFingersL", "SetVRSmokeFingersL", &SetVRSmokeFingersL);
+    f15oLF->flags = flags; f15oLF->SetReturnType("Int32"); f15oLF->AddParam("Int32", "active"); rtti->RegisterFunction(f15oLF);
+
+    auto f15oLCig = RED4ext::CGlobalFunction::Create("SetVRSmokeLeftCig", "SetVRSmokeLeftCig", &SetVRSmokeLeftCig);
+    f15oLCig->flags = flags; f15oLCig->SetReturnType("Int32"); f15oLCig->AddParam("Int32", "on"); rtti->RegisterFunction(f15oLCig);
+
+    auto f15oLC = RED4ext::CGlobalFunction::Create("VRSmokeCaptureFingersL", "VRSmokeCaptureFingersL", &VRSmokeCaptureFingersL);
+    f15oLC->flags = flags; f15oLC->SetReturnType("Int32"); rtti->RegisterFunction(f15oLC);
+
+    auto f15oLE = RED4ext::CGlobalFunction::Create("SetVRSmokeLighter", "SetVRSmokeLighter", &SetVRSmokeLighter);
+    f15oLE->flags = flags; f15oLE->SetReturnType("Int32"); f15oLE->AddParam("Int32", "enable"); rtti->RegisterFunction(f15oLE);
+
+    auto f15oLO = RED4ext::CGlobalFunction::Create("SetVRSmokeLighterOffset", "SetVRSmokeLighterOffset", &SetVRSmokeLighterOffset);
+    f15oLO->flags = flags; f15oLO->SetReturnType("Int32");
+    f15oLO->AddParam("Float", "x"); f15oLO->AddParam("Float", "y"); f15oLO->AddParam("Float", "z");
+    f15oLO->AddParam("Float", "pitch"); f15oLO->AddParam("Float", "yaw"); f15oLO->AddParam("Float", "roll");
+    rtti->RegisterFunction(f15oLO);
+
+    auto f15oTF = RED4ext::CGlobalFunction::Create("SetVRSmokeThumbFlickL", "SetVRSmokeThumbFlickL", &SetVRSmokeThumbFlickL);
+    f15oTF->flags = flags; f15oTF->SetReturnType("Int32");
+    f15oTF->AddParam("Float", "pitch"); f15oTF->AddParam("Float", "yaw"); f15oTF->AddParam("Float", "roll");
+    rtti->RegisterFunction(f15oTF);
+
+    auto f15oTP = RED4ext::CGlobalFunction::Create("SetVRSmokeThumbPressL", "SetVRSmokeThumbPressL", &SetVRSmokeThumbPressL);
+    f15oTP->flags = flags; f15oTP->SetReturnType("Int32"); f15oTP->AddParam("Float", "amount"); rtti->RegisterFunction(f15oTP);
 
     auto f15p = RED4ext::CGlobalFunction::Create("SetVRBindMode", "SetVRBindMode", &SetVRBindMode);
     f15p->flags = flags; f15p->SetReturnType("Int32"); f15p->AddParam("Int32", "mode"); rtti->RegisterFunction(f15p);
@@ -6646,6 +7560,11 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterTypes() {
     fProvReset->flags = flags; rtti->RegisterFunction(fProvReset);
     auto fProvQM = RED4ext::CGlobalFunction::Create("SetVRProvQuatMode", "SetVRProvQuatMode", &SetVRProvQuatMode);
     fProvQM->flags = flags; fProvQM->AddParam("Int32", "mode"); fProvQM->AddParam("Int32", "axis"); rtti->RegisterFunction(fProvQM);
+    auto fMuzP = RED4ext::CGlobalFunction::Create("SetVRMuzzlePos", "SetVRMuzzlePos", &SetVRMuzzlePos);
+    fMuzP->flags = flags;
+    fMuzP->AddParam("Float", "x"); fMuzP->AddParam("Float", "y"); fMuzP->AddParam("Float", "z");
+    rtti->RegisterFunction(fMuzP);
+
     auto fMuz = RED4ext::CGlobalFunction::Create("SetVRMuzzleQuat", "SetVRMuzzleQuat", &SetVRMuzzleQuat);
     fMuz->flags = flags; fMuz->AddParam("Float","i"); fMuz->AddParam("Float","j"); fMuz->AddParam("Float","k"); fMuz->AddParam("Float","r"); rtti->RegisterFunction(fMuz);
     auto fZoom = RED4ext::CGlobalFunction::Create("SetVRZoomLevel", "SetVRZoomLevel", &SetVRZoomLevel);

@@ -1,8 +1,9 @@
 # CyberpunkVR Port
 
-A 6-DoF **VR mod for Cyberpunk 2077**. An OpenXR `dxgi.dll` proxy injects head
-tracking and stereo into REDengine, a RED4ext plugin drives a **full-body VR
-avatar with motion-controlled hands**, and a set of CET / redscript mods add VR
+A 6-DoF **VR mod for Cyberpunk 2077**, built as a **RED4ext plugin** — there is no
+`dxgi.dll` proxy any more. `CyberpunkVR_Stereo` drives OpenXR head tracking, real
+stereo and the in-headset overlay; `CyberpunkVR_Hands` drives a **full-body VR
+avatar with motion-controlled hands**; and a set of CET / redscript mods add VR
 weapon aiming, motion melee, hand-to-holster equipping, a VR-friendly HUD and
 more. Everything is configured from an in-headset **F10** overlay.
 
@@ -13,28 +14,42 @@ Repository: <https://github.com/dariulone/cyberpunk-vr-port>
 
 ## Features
 
-- **OpenXR head tracking** injected into the REDengine render path, with runtime
-  FOV-based projection and world-scale / IPD controls.
-- **AER V2 reprojection** — per-eye / intermediate frames synthesised from the
-  game's mono output via NVIDIA Optical Flow + a depth-aware warp (unified
-  producer, late IPD). Automatic D3D12-compute fallback without CUDA.
-- **Full-body VR avatar** (VRIK) — body under the HMD, arm-length
-  calibration, leg IK, real-life squat. Hands are with the controllers.
+- **Real stereo, not reprojection.** The second eye is an actual engine view — a
+  render-to-texture camera on the player entity that runs the frame graph for its
+  own eye, from its own position, with its own projection. It falls back to mono
+  automatically whenever that view has nothing fresh to give (menus, loading).
+- **OpenXR head tracking** injected into the REDengine render path, with the
+  submitted frustum matching the one the engine actually rendered on both axes,
+  plus world-scale / IPD controls.
+- **The game HUD in both eyes** — the engine's own HUD composite is ported
+  shader-for-shader for the second eye, and placed at a finite distance so icons
+  fuse instead of splitting.
+- **Full-body VR avatar** (VRIK) — body under the HMD, arm-length calibration,
+  leg IK, real-life squat. Hands are with the controllers.
 - **Decoupled VR weapon aim** — bullets follow the real weapon muzzle, not the
-  camera; optional barrel crosshair dot, scope-zoom aware.
+  camera; optional barrel dot in both eyes, scope-zoom aware.
+- **Collimated reflex sights** — the reticle is placed by angle along the sight's
+  own optical axis, so it stays on the bore instead of sliding across the glass
+  when you look at the sight from the side.
 - **VR motion melee** — real swings trigger the game's native melee along the
   blade (native damage/reaction/stamina).
 - **Hand-to-holster** equip/unequip on a grip squeeze — *immersive* (by visual
   holster) or *simple* (fixed weapon slots).
+- **VR smoking** — cigarette and lighter as real props, with a captured
+  finger grip, a hands-free mouth anchor and the game's own FX and audio.
 - **VR controller mapping** merged into XInput: full-forward = sprint,
-  full-down = crouch, snap or smooth turn, HMD/hand-relative locomotion.
+  full-down = crouch, snap or smooth turn, HMD/hand-relative locomotion, D-pad
+  chord.
 - **VR HUD** with per-element placement & scale, **world-map head-lock**, CAS
-  sharpening, and DLSS/NGX handling.
+  sharpening, and DLSS/NGX handling (the second view gets its own upscaler
+  viewport automatically).
 - **In-headset F10 overlay** with tabbed, live, persisted settings.
 - SteamVR (OpenVR) runtime supported alongside OpenXR; pre-launch resolution
-  selector; quiet-by-default logging with a verbose toggle.
+  selector; quiet-by-default logging with a DEBUG toggle in the launcher.
 
-See [`docs/`](docs/) for engineering notes (e.g. the stereo R&D writeup).
+See [`docs/`](docs/) for engineering notes, and
+[`docs/RELEASE-0.1.0.txt`](docs/RELEASE-0.1.0.txt) for how the stereo path is
+actually built.
 
 ## Requirements
 
@@ -44,10 +59,11 @@ See [`docs/`](docs/) for engineering notes (e.g. the stereo R&D writeup).
 - ArchiveXL
 - TweakXL
 - redscript
-- Codeware
+- Codeware (**1.20 or newer** — older builds fail script compilation)
 - Visual Holsters (Automatic Clothes Swap)
 - Visible Bullets (Projectile Restoration)
 - Equipment-EX
+- Nova Optics
 
 Install RED4ext, CET and redscript first (the usual Nexus dependencies).
 
@@ -58,19 +74,29 @@ game root** (the folder that contains `bin\`, `r6\`, `red4ext\`). The files land
 as:
 
 ```
-bin\x64\dxgi.dll                                              # VR proxy (OpenXR + stereo + AER + F10 overlay)
+red4ext\plugins\CyberpunkVR_Stereo\CyberpunkVR_Stereo.dll     # the VR plugin: OpenXR, stereo, overlay
+red4ext\plugins\CyberpunkVR_Stereo\CyberpunkVR_Sight*.dxil    # sight shaders, loaded by name at PSO swap
 red4ext\plugins\CyberpunkVR_Hands\CyberpunkVR_Hands.dll       # native plugin (avatar/hands, weapon aim, shared bridge)
-bin\x64\plugins\cyber_engine_tweaks\mods\CyberpunkVRPort_*\   # CET mods: HUD, Holster, VRIK, Weapon, WorldMap
+bin\x64\plugins\cyber_engine_tweaks\mods\CyberpunkVRPort_*\   # CET mods: Stereo (VRCAM select), HUD, Holster, VRIK, Weapon, WorldMap
 r6\scripts\CyberpunkVRPort_*\                                 # redscript: HUD, Holster, Melee, NoAnims, WeaponUp, WorldMap
 ```
 
 Then **start your OpenXR runtime first**, and launch the game.
 
-> Proxy-only install (camera/stereo, no avatar/weapons): just drop
-> `bin\x64\dxgi.dll` next to `Cyberpunk2077.exe`. The avatar, weapon, holster,
-> HUD and world-map features additionally need RED4ext + CET + redscript and the
-> bundled mods above.
+> There is no `dxgi.dll` any more — this is a RED4ext plugin. Anything else that
+> proxies dxgi (R.E.A.L. VR, for one) must be out of `bin\x64` or the two fight
+> over the same engine hooks; `scripts\deploy_stereo.ps1` moves one aside for you.
 
+> Keep only one `.dll` in each `red4ext\plugins\CyberpunkVR_*` folder. RED4ext
+> loads **every** DLL it finds there, so a renamed backup beside the real build
+> loads as a second copy of the plugin and the two fight over the same hooks.
+
+From a source tree, install with:
+
+```
+cmake --build build --config Release --target cyberpunkvrport_stereo
+pwsh scripts\deploy_stereo.ps1 -GameRoot "<game root>"
+```
 
 ## Controls
 
@@ -87,15 +113,15 @@ VR controller input is merged into the native CP2077 gamepad, so the in-game
 | Left grip | Crouch (shoulder) |
 | A / B | Jump / Dodge |
 | X / Y | Reload·interact / Weapon switch |
-| Left thumb click / Right thumb click | Sprint (L3) / Crouch (R3) |
+| Right thumb click | Crouch (R3) |
 | Left menu button | Pause menu |
 | Swing a melee weapon | VR motion melee (native attack along the blade) |
-| DPAD EMULATION |
-| Right Grip + RightThumb UP | DPAD UP |
-| Right Grip + RightThumb DOWN | DPAD DOWN |
-| Right Grip + RightThumb LEFT | DPAD LEFT |
-| Right Grip + RightThumb RIFHT | DPAD RIGHT |
 
+**D-pad chord.** Hold the **left stick clicked in**, then pick the direction with
+the **right stick** — up / down / left / right. While the chord is held the right
+stick is taken out of the camera, so selecting a direction cannot snap-turn you.
+Release the left stick *without* having chosen a direction and it emits the normal
+L3 (sprint) press instead, so nothing is lost by using it.
 
 Buttons follow each runtime's interaction profile (Touch / Index / Vive / WMR);
 customise the actual actions in the game's *Settings → Key Bindings → Controller*.
@@ -107,25 +133,36 @@ Hotkeys:
 
 ## In-headset overlay (F10)
 
-Tabbed, live, and saved to `vrport.ini`:
+Five tabs, live, and saved to `vrport.ini` — nothing here needs a restart.
 
-- **General** — FOV / world scale / IPD, AER & mono submit, pose pair-lock,
-  motion prediction, sharpening, runtime selection.
-- **Controller** — XInput merge, locomotion source (Game / HMD / Left / Right
-  hand), snap turn + angle, HMD-only pitch, **Immersive holsters** toggle.
+- **General** — world scale, IPD scale, stereo separation, VR menu FOV and quad
+  size, motion prediction, reuse-last-clean-frame, pose pair-lock, and the head
+  offset (X right / Y forward / Z up).
+- **Controls** — decoupled weapon aim and its laser dot, locomotion source
+  (Game / HMD / left hand / right hand), snap turn and angle, immersive holsters.
+- **Stereo** — the second eye itself: which eye VRCAM is sent to, how stale its
+  last frame may get before the submit falls back to mono, the HUD composite, and
+  the live counters that say whether the second view is producing, being captured
+  and reaching the headset.
 - **VRIK** — start/stop tracking, IK calibration (reach scale, height, elbow
   swing/pole, wrist offset), diagnostics.
 - **HUD** — per-element X / Y / scale for every HUD group.
+
+The launcher (before the game starts) picks the render resolution and carries a
+**DEBUG** tick-box that arms every diagnostic probe at once. Leave it off for
+play: it is for diagnosis and it costs both frame time and a very large log.
 
 ## Mod components
 
 | Component | Type | Purpose |
 |---|---|---|
-| `dxgi.dll` | proxy DLL | OpenXR head tracking, stereo, AER V2 reprojection, F10 overlay, XInput merge |
-| `CyberpunkVR_Hands.dll` | RED4ext plugin | Full-body avatar / hand IK, weapon-aim orientation override, shared-memory bridge |
+| `CyberpunkVR_Stereo.dll` | RED4ext plugin | OpenXR head tracking, the second engine view, HUD composite, sight shaders, F10 overlay, XInput merge |
+| `CyberpunkVR_Hands.dll` | RED4ext plugin | Full-body avatar / hand IK, weapon-aim orientation override, smoking poses, shared-memory bridge |
+| `CyberpunkVRPort_Stereo` | CET | Enables the VRCAM component the launcher picked |
 | `CyberpunkVRPort_VRIK` | CET | Starts hand tracking, bridges calibration |
 | `CyberpunkVRPort_Weapon` | CET | Decoupled weapon aim + VR motion-melee detection |
 | `CyberpunkVRPort_Holster` | CET + reds | Hand-to-holster equip/unequip (immersive / simple) |
+| `CyberpunkVRPort_Smoking` | CET + reds | Cigarette / lighter props, FX, audio, auto-puff |
 | `CyberpunkVRPort_HUD` | CET + reds | VR HUD layout |
 | `CyberpunkVRPort_WorldMap` | CET + reds | World-map head-lock |
 | `CyberpunkVRPort_Melee` | reds | Native melee along the blade segment |
@@ -134,27 +171,13 @@ Tabbed, live, and saved to `vrport.ini`:
 
 ## Logs
 
-- `Cyberpunk 2077\bin\x64\cyberpunkvrport.log` — main proxy log (quiet by
-  default; enable **F10 → verbose log** for deep per-frame diagnostics).
-- Per-mod CET logs live in each mod folder. Preferred file for bug reports is the
-  main proxy log.
-
-## Media
-
-[![Cyberpunk VR Short 1](https://img.youtube.com/vi/Q_nt0dceXNU/0.jpg)](https://www.youtube.com/shorts/Q_nt0dceXNU)
-[![Cyberpunk VR Short 2](https://img.youtube.com/vi/CXeYW1_FTWE/0.jpg)](https://www.youtube.com/shorts/CXeYW1_FTWE)
-
-![IMG_6564](images/IMG_6564.jpg)
-![IMG_6566](images/IMG_6566.jpg)
-![IMG_6570](images/IMG_6570.jpg)
-![IMG_6573](images/IMG_6573.JPG)
-
-*Photos taken through PICO 4 lenses with an iPhone 13 Pro Max.*
-
-![Boe6Eod7Nty Valve Index](images/Boe6Eod7Nty_valve_index.jpg)
-![Boe6Eod7Nty Valve Index 2](images/Boe6Eod7Nty_valve_index_2.jpg)
-
-*Valve Index (canted-display OpenXR) shots courtesy of [Boe6Eod7Nty](https://github.com/Boe6Eod7Nty).*
+- `Cyberpunk 2077\bin\x64\cyberpunkvrport.log` — the plugin's own log, and the
+  right file for a bug report. Quiet by default; tick **DEBUG** in the launcher
+  for per-frame diagnostics.
+- `Cyberpunk 2077\red4ext\logs\` — script validation and plugin load errors. If
+  redscript compilation fails, *every* redscript mod is off, not just the one that
+  failed, so check here first when something stops working all at once.
+- Per-mod CET logs live in each mod folder; they follow the same DEBUG switch.
 
 ## Test hardware used during development
 
@@ -163,10 +186,3 @@ Tabbed, live, and saved to `vrport.ini`:
 - GPU: NVIDIA RTX 5070 Ti
 - RAM: 32 GB DDR4
 - OS: Windows 11 Pro 25H2 (26200)
-
-## Credits & license
-
-Created by [dariulone](https://github.com/dariulone), Valve Index testing by
-[Boe6Eod7Nty](https://github.com/Boe6Eod7Nty). Built on OpenXR, Dear ImGui,
-RED4ext, Cyber Engine Tweaks, redscript and the NVIDIA Optical Flow SDK. See
-[`LICENSE`](LICENSE).

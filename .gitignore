@@ -12,7 +12,11 @@
 *.cbv.tsv
 CyberpunkVRProxy.live.txt
 CyberpunkVRProxy.log
-tools/
+# tools/ is scratch, with one exception. Note the glob: `tools/` would exclude the directory
+# itself and git never descends into an excluded directory, so the negation below would not fire.
+tools/*
+!tools/xr_probe/
+!tools/crash/
 releases/
 *.py
 memory/
@@ -22,6 +26,17 @@ package.json
 !.opencode/memory/*.md
 *.zip
 *.ps1
+# ...except the probe layer install scripts, which are part of the tool,
+!tools/xr_probe/*.ps1
+# the install/uninstall pair, which is how the mod is meant to be deployed,
+!scripts/deploy_stereo.ps1
+!scripts/revert_stereo.ps1
+!scripts/sync_assets.ps1
+!scripts/build_dist.ps1
+# and the asset generator, which authors the VRCAM components the launcher offers.
+!tools/gen_vrcam_assets.py
+# and the crash-dump reader, which is how a tester's .dmp gets turned into a stack.
+!tools/crash/read_dump.py
 
 # Runtime diagnostic dumps (moved out of repo root)
 /dumps/
@@ -60,3 +75,8 @@ mods/cet/**/vrik_recenter.ini
 
 # Large third-party reference PDFs (GDC / SIGGRAPH talks; kept out of the repo)
 /docs/external/
+# Claude Rewind Tool
+.claude-rewind/
+
+# Stereo-plugin build output
+/build-stereo/
