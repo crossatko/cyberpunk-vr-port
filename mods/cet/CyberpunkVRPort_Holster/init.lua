@@ -81,6 +81,13 @@ registerForEvent('onUpdate', function(dt)
     local pl = Game.GetPlayer()
     if not pl then return end
 
+    -- While a cigarette is in the hands it occupies the WeaponRight slot -- which this mod would
+    -- read as a held weapon -- and the right grip is what puts the cig in the mouth. Both of those
+    -- collide, so suspend every holster gesture until the cig is put away. pcall because
+    -- VRSmokeHasCig only exists when the smoking mod is installed.
+    local okSmoke, smoking = pcall(function() return pl:VRSmokeHasCig() end)
+    if okSmoke and smoking then return end
+
     sinceScan = sinceScan + dt
     if sinceScan >= 1.0 then sinceScan = 0.0; rescan(pl) end
 

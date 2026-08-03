@@ -172,6 +172,20 @@ extern volatile uint64_t g_waXhMutated;
 extern volatile int      g_waXhSnapped;
 extern volatile float    g_waXhPos[4];   // captured cache+0x350 (pre-write)
 extern volatile float    g_waXhDir[4];   // captured cache+0x370 (pre-write)
+// THE ORIGIN, which is a separate lever from the direction. The direction in this cache was
+// measured dead in June -- it is UI/screen-space -- and stays untouched. But the same cache
+// carries where the aim ray STARTS, and that start is the head: measured in one frame,
+//     cache+0x350 = (3187.41, -376.533, 135.104)
+//     muzzle      = (3187.10, -376.545, 134.358)
+// 0.75 m above the barrel and 0.31 m in front of it. That offset is the whole defect: the shot
+// already flies ALONG the barrel (the launch-orientation override does that), it just begins at
+// the eye. A sight is only truthful from the point the bullet leaves, so it was exact for the
+// left eye -- MAIN is both the gameplay camera and the left render camera -- and off by a
+// constant 65 mm for the right, at every range. Moving the start to the muzzle puts the barrel
+// and the sight on the same weapon, which is the only arrangement that is right for both eyes.
+extern volatile float    g_provMuzzlePos[3];
+extern volatile uint32_t g_provMuzzlePosSeq;
+extern volatile int      g_waXhPosFromMuzzle;
 typedef void* (*WaXhUpd_t)(void*, void*, void*, void*);
 static WaXhUpd_t OrigWaXhUpd = nullptr;
 
@@ -183,10 +197,30 @@ extern "C" inline void* Hooked_WaXhUpd(void* rcx, void* rdx, void* r8, void* r9)
             if (cache) {
                 float* pos = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(cache) + 0x350);
                 float* dir = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(cache) + 0x370);
-                // One-shot snapshot of the original cache fields (to learn the format).
-                if (!g_waXhSnapped) {
-                    for (int i = 0; i < 4; ++i) { g_waXhPos[i] = pos[i]; g_waXhDir[i] = dir[i]; }
-                    g_waXhSnapped = 1;
+                // LIVE snapshot, pre-write, every call -- not one-shot. The single sample was
+                // taken on the first call of the session and caught the field in a different
+                // state each time: world coordinates in one run (3187, -376, 135) and small
+                // local-looking numbers with z = 1.6 in the next. Two readings of the same field
+                // that disagree by three kilometres cannot both be acted on, and it matters
+                // which one is live: the override below writes a WORLD position into it.
+                for (int i = 0; i < 4; ++i) { g_waXhPos[i] = pos[i]; g_waXhDir[i] = dir[i]; }
+                g_waXhSnapped = 1;
+                // ORIGIN -> muzzle. Guarded on a published position that is actually a world
+                // coordinate, so a zero or stale publish leaves the engine's own value alone
+                // rather than teleporting the shot to the world origin.
+                // Refuse to write a world coordinate into a field that is currently holding a
+                // local one: if what is there is small, this is not the world-space slot and the
+                // engine's own value is left alone. Guessing wrong here sends the shot three
+                // kilometres away, so it fails closed.
+                const bool posLooksWorld = (pos[0]*pos[0] + pos[1]*pos[1] + pos[2]*pos[2]) > 10000.0f;
+                if (g_waXhPosFromMuzzle && g_provMuzzlePosSeq && posLooksWorld) {
+                    const float mx = g_provMuzzlePos[0];
+                    const float my = g_provMuzzlePos[1];
+                    const float mz = g_provMuzzlePos[2];
+                    if (mx*mx + my*my + mz*mz > 1.0f) {
+                        pos[0] = mx; pos[1] = my; pos[2] = mz;
+                        ++g_waXhMutated;
+                    }
                 }
                 if (false /* DISABLED 2026-06-15: crosshair-cache dir = UI/screen-space, dead lever */) {
                     const float fx = g_waFwd[0], fy = g_waFwd[1], fz = g_waFwd[2];

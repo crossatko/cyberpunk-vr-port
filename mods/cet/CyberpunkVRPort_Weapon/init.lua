@@ -13,9 +13,34 @@
 --      (mod CyberpunkVRPort_Melee). The native box-sweep does collision/damage/reaction/stamina, so
 --      it behaves like the flat game. A fast swing = power/cleave. No-op for guns (self-filtering).
 
-local function logf(fmt, ...)
+-- ONE DEBUG SWITCH FOR THE WHOLE PORT, read from shared slot [156].
+--
+-- The plugin republishes the launcher's DEBUG checkbox there every frame, so this bridge obeys the
+-- same switch as everything else and can be flipped without editing a file. It used to be a
+-- hardcoded `local DEBUG = true`, which is how one session left 26 449 lines and 5 MB of per-frame
+-- state in this mod's log alone.
+--
+-- Cached for a quarter second: this is called from onUpdate and a shared-memory read per frame to
+-- decide whether to not log is a poor trade.
+local dbgCache, dbgAt = false, -1.0
+local function vrDebug()
+    local now = (os and os.clock and os.clock()) or 0.0
+    if now - dbgAt > 0.25 then
+        dbgAt = now
+        dbgCache = (type(GetVRSharedSlot) == 'function') and (GetVRSharedSlot(156) > 0.5) or false
+    end
+    return dbgCache
+end
+
+-- Routine chatter. Anything that must survive DEBUG=0 -- a failure, a one-time fact -- calls
+-- logAlways instead.
+local function logAlways(fmt, ...)
     local ok, s = pcall(string.format, fmt, ...)
     if ok then spdlog.info("[CyberpunkVRPort_Weapon] " .. s) end
+end
+local function logf(fmt, ...)
+    if not vrDebug() then return end
+    logAlways(fmt, ...)
 end
 
 local installed = false
@@ -111,12 +136,86 @@ end
 -- Publish the muzzle world orientation. The plugin (SetVRMuzzleQuat) uses it for the launch
 -- override (bullet leaves the barrel) AND writes the muzzle forward to shared mem for the
 -- overlay's barrel laser dot.
+local muzzlePosWarned = false
+local muzzlePosProbed = false
+local muzzleEnumDone = false
 local function updateMuzzle(wpn)
     local xf = wpn:GetMuzzleSlotWorldTransform()
     if not xf then return end
     local q = xf.Orientation or (xf.GetOrientation and xf:GetOrientation())
     if q and type(SetVRMuzzleQuat) == 'function' then
         SetVRMuzzleQuat(q.i, q.j, q.k, q.r)
+    end
+    -- The POSITION half of the same transform, which used to be dropped on the floor. The launch
+    -- override replaced the shot's direction with the muzzle's and left its origin at the game
+    -- camera -- i.e. at the left eye -- so the bullet flew parallel to the barrel but started an
+    -- IPD away from the eye that was aiming. pcall'd because a wrong accessor here would take the
+    -- whole weapon mod down with it, and with it the barrel dot and the aim override.
+    -- Position, fetched the same way the line above fetches orientation: field first, then
+    -- getter. The probe said xf.Position is nil outright, and WorldTransform exposes it as
+    -- GetWorldPosition() -- exactly the field-or-method shape already used for the quaternion.
+    -- Enumerated, not guessed: this object exposes `position` (lower case) and GetPosition().
+    -- `Position` and GetWorldPosition() -- the two names I tried first -- do not exist on it.
+    local pos = xf.position
+    if not pos and xf.GetPosition then pos = xf:GetPosition() end
+
+    -- Neither exists on this object, so stop guessing names one per round-trip and ask it what
+    -- it has. Orientation is the control: that one is known to work, so if it does not show up
+    -- in the listing then the listing itself is the thing that does not work here.
+    if not pos and not muzzleEnumDone then
+        muzzleEnumDone = true
+        local keys = {}
+        pcall(function()
+            for k, _ in pairs(xf) do keys[#keys + 1] = tostring(k) end
+        end)
+        logf("muzzle xf: type=%s  keys=[%s]", type(xf), table.concat(keys, ", "))
+        local names = { 'Position', 'position', 'WorldPosition', 'Translation', 'Trans',
+                        'Orientation', 'GetWorldPosition', 'GetPosition', 'ToVector4',
+                        'GetOrientation' }
+        local found = {}
+        for _, n in ipairs(names) do
+            local t = 'nil'
+            pcall(function() t = type(xf[n]) end)
+            if t ~= 'nil' then found[#found + 1] = n .. '=' .. t end
+        end
+        logf("muzzle xf members: %s", table.concat(found, "  "))
+        -- And the weapon itself, in case the muzzle position is reachable from there instead.
+        local wt = 'nil'
+        pcall(function() wt = tostring(wpn:GetWorldPosition()) end)
+        logf("muzzle fallback: wpn:GetWorldPosition() = %s", wt)
+    end
+
+    if type(SetVRMuzzlePos) == 'function' and pos then
+        local x, y, z
+        -- WorldPosition keeps 17-bit fixed point, the same 1/131072 the render camera and the
+        -- instance transforms use; a plain Vector4 keeps floats. Take whichever this build has.
+        pcall(function()
+            if type(pos.x) == 'number' then
+                x, y, z = pos.x, pos.y, pos.z
+            elseif pos.x and pos.x.Bits then
+                x, y, z = pos.x.Bits / 131072.0, pos.y.Bits / 131072.0, pos.z.Bits / 131072.0
+            elseif pos.ToVector4 then
+                local v = pos:ToVector4()
+                if v then x, y, z = v.x, v.y, v.z end
+            elseif WorldPosition and WorldPosition.ToVector4 then
+                local v = WorldPosition.ToVector4(pos)
+                if v then x, y, z = v.x, v.y, v.z end
+            end
+        end)
+        if x then
+            SetVRMuzzlePos(x, y, z)
+            if not muzzlePosProbed then
+                muzzlePosProbed = true
+                logf("muzzlePos OK: (%.4f, %.4f, %.4f)", x, y, z)
+            end
+        elseif not muzzlePosWarned then
+            muzzlePosWarned = true
+            logf("muzzlePos: got %s but no component accessor matched (x type=%s)",
+                 type(pos), type(pos.x))
+        end
+    elseif not muzzlePosWarned then
+        muzzlePosWarned = true
+        logf("muzzlePos: native=%s pos=%s", type(SetVRMuzzlePos), type(pos))
     end
 end
 
@@ -131,6 +230,16 @@ registerForEvent('onUpdate', function(dt)
         if installTimer > 3.0 and type(InstallVRProvInstrument) == 'function' then
             local r = 0
             pcall(function() r = InstallVRProvInstrument() end)
+            -- The weapon-aim family: XFORM-GETTER, the shot bracket and physArgSnapshot. All of it has
+            -- been sitting at installed=0, which is why every one of those counters reads zero in the
+            -- dump. It is what the launch ORIGIN has to be found with -- the provider slots do not
+            -- carry it (slots 3..42 return nothing that looks like a world position). Read-only until
+            -- something is told to mutate.
+            if type(InstallWeaponAimHook) == 'function' then
+                logf('InstallWeaponAimHook = %s', tostring(InstallWeaponAimHook()))
+            else
+                logf('InstallWeaponAimHook: native missing')
+            end
             logf("InstallVRProvInstrument = %s", tostring(r))
             installed = true
         end

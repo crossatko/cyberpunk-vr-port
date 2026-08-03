@@ -2,7 +2,7 @@
 // ============================================================================
 // CyberpunkVR_Hands_Shared -- THE shared-memory float block (single source of
 // truth for slot numbering). All three C++ modules map the SAME named mapping:
-//   dxgi_proxy.cpp      (GetShotShared)        -- render/present threads
+//   vr_core.cpp      (GetShotShared)        -- render/present threads
 //   openxr_manager.cpp  (SetSharedSlot/sShared) -- OpenXR present thread
 //   red4ext_plugin      (g_pSharedHands)        -- game/anim threads + Lua natives
 // Size: 1024 bytes = 256 floats (mapped as 1024 in every module).
@@ -92,9 +92,15 @@
 // ---------------------------------------------------------------------------
 // GRAVEYARD (dead -- reclaim before growing past [150])
 // ---------------------------------------------------------------------------
-//  [67..69]    never used (except a brief LT-inject melee-guard experiment, removed same session:
-//              the VR guard went STAT-driven — IsBlocking/IsDeflecting set directly by the CET
-//              weapon mod, no PSM Block state, no debuffs — so the input channel died unused)
+//  [69]        never used (it was [67..69] once: a brief LT-inject melee-guard experiment, removed
+//              the same session — the VR guard went STAT-driven, IsBlocking/IsDeflecting set
+//              directly by the CET weapon mod, no PSM Block state, no debuffs — so the input
+//              channel died unused).
+//              [67] AND [68] ARE NOT FREE and this line used to say they were. [67] is the
+//              hand-sample stamp written inside the hands seqlock, [68] a QPC millisecond
+//              timestamp in the view packet. Both are large numbers. The smoking mod's CET bridge
+//              read them as "left trigger" and "left grip" and got a lighter that ignited by
+//              itself and a grip that was never released.
 //  [84]        reclaimed by [CAMWRITE] mode flag (was: never used)
 //  [100..103]  reclaimed by [CAMWRITE] desired quat (was: never used)
 //  [112..115]  old view stabilizer delta+valid (removed session 3)
@@ -103,7 +109,12 @@
 //              consumed [132..134] briefly -- removed after live test)
 //  [137..140]  located camera entity-local (writer removed)
 //  [145]       FinalCamera poison-test counter (removed session 3)
-//  [154..255]  never used ([151..153] taken by [CAMWRITE] seq/ack/entity-yaw)
+//  [154..255]  mostly unused, but NOT a blank cheque -- [200..202] carry a right-hand debug
+//              position read by the overlay and [227..230] an XR pose quaternion read by
+//              vrik_hook. Check with a grep, not with this comment.
+//  [154]       left trigger analog (0..1)     plugin -> Smoking CET bridge
+//  [155]       left grip pressed (0/1)        plugin -> Smoking CET bridge
+//  [156]       DEBUG logging on (0/1)         plugin -> every CET bridge
 // ============================================================================
 
 namespace vrshared {
@@ -128,4 +139,14 @@ constexpr int kWeaponFlag   = 144;
 constexpr int kSnapDelta    = 146;
 constexpr int kSnapCounter  = 147;
 constexpr int kSnapPreHeading = 148;
+// Left-hand inputs. The right grip lives at the legacy [49]; these two had no channel until the
+// smoking mod needed them, so they are named rather than numbered -- picking a slot off the map's
+// word alone is exactly what put the lighter on a millisecond timestamp.
+constexpr int kLeftTriggerAnalog = 154;
+constexpr int kLeftGripPressed   = 155;
+// The launcher's DEBUG checkbox, republished so the Lua side obeys the same switch as the plugin.
+// Without it every CET bridge logged per frame unconditionally: 26 449 lines and 5 MB from the
+// smoking one alone in a single session, and as much again from the weapon one. A log nobody can
+// open is a log nobody reads.
+constexpr int kDebugLog          = 156;
 } // namespace vrshared
