@@ -1435,25 +1435,6 @@ bool DrawLiveControls(LiveControlsUiState& state) {
             ImGui::SetTooltip("Off by default for a clean cyberpunkvrport.log. Enable only\n"
                               "when capturing ClipCursor / depth / hook diagnostics.");
         }
-        // Both DLSS knobs are AER-era and ship OFF. Left here because they are the only way to
-        // put them back without a rebuild, and because turning one on is a one-line experiment.
-        changed |= CheckboxInt("DLSS matrix hook (AER-era, off)", &state.xrDLSSMatrixHook);
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Injects our own projection into the DLSS state and remaps its\n"
-                              "temporal slot. Written for alternate-eye rendering, which this\n"
-                              "port no longer does. On a mono frame it hands DLSS a projection\n"
-                              "built from the forced render dims, which need not agree with the\n"
-                              "view the engine actually rasterised.");
-        }
-        changed |= SliderIntClamped("DLSS slot mode", &state.xrDLSSSlotMode, 0, 8);
-        changed |= SliderIntClamped("DLSS log stride", &state.xrDLSSLogStride, 0, 3000);
-        changed |= CheckboxInt("DLSS resolution override (AER-era, off)", &state.xrDLSSResOverride);
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Forces the launcher dims into the DLSS resolution struct\n"
-                              "(+0x04/+0x18/+0x1C). The engine writes one value into all three\n"
-                              "there; overwriting them changes what DLSS thinks it is scaling.\n"
-                              "Off leaves the upscaler's own pipeline alone.");
-        }
             }
             ImGui::EndTabItem();
         }

@@ -87,12 +87,6 @@ struct LiveControls {
     volatile float xrMenuFov;
     volatile float xrMenuFollowDeg; // head-vs-panel yaw offset (deg) that starts the lazy menu re-center
     volatile int xr3DofMovement;
-    // BOTH DLSS KNOBS DEFAULT OFF -- they are AER-era machinery, see the note on
-    // ApplyDLSSResolutionOverride. Kept because they are the only live way back in.
-    volatile int xrDLSSMatrixHook;   // 1 = inject our projection into the DLSS state + remap slots
-    volatile int xrDLSSSlotMode;
-    volatile int xrDLSSLogStride;
-    volatile int xrDLSSResOverride;  // 1 = force our dims into the DLSS resolution struct
     // 1 = this is still the first launch, i.e. the shipped UserSettings.json has not been
     // installed yet. ApplyFirstLaunchGameSettings CLEARS it to 0 once it has, so a player's own
     // tuning is never overwritten twice. See the note there.
@@ -225,10 +219,6 @@ static void EnsureLiveControlFileExists() {
     fprintf(file, "xr_menu_fov=65.0\n");
     fprintf(file, "xr_menu_follow_deg=60.0\n");
     fprintf(file, "xr_3dof_movement=0\n");
-    fprintf(file, "xr_dlss_matrix_hook=0\n");
-    fprintf(file, "xr_dlss_slot_mode=0\n");
-    fprintf(file, "xr_dlss_log_stride=600\n");
-    fprintf(file, "xr_dlss_res_override=0\n");
     fprintf(file, "first_launch=1\n");
     fprintf(file, "xr_motion_predict_ms=0.0\n");
     fprintf(file, "xr_stereo_scale=1.0\n");
@@ -440,10 +430,6 @@ static void PollLiveControls() {
     float xrPitchScale = 1.35f;
     int xrSyncSequential = 1;
     int xr3DofMovement = 0;
-    int xrDLSSMatrixHook = 0;
-    int xrDLSSSlotMode = 0;
-    int xrDLSSLogStride = 600;
-    int xrDLSSResOverride = 0;
     int xrFirstLaunch = 1;
     float xrMotionPredictMs = 0.0f;
     float xrStereoScale = 1.0f;
@@ -575,27 +561,6 @@ static void PollLiveControls() {
         if (sscanf_s(line, "xr_3dof_movement=%d", &intValue) == 1 ||
             sscanf_s(line, "xr_3dof_movement = %d", &intValue) == 1) {
             xr3DofMovement = intValue;
-            continue;
-        }
-
-        if (sscanf_s(line, "xr_dlss_matrix_hook=%d", &intValue) == 1 ||
-            sscanf_s(line, "xr_dlss_matrix_hook = %d", &intValue) == 1) {
-            xrDLSSMatrixHook = intValue;
-            continue;
-        }
-        if (sscanf_s(line, "xr_dlss_slot_mode=%d", &intValue) == 1 ||
-            sscanf_s(line, "xr_dlss_slot_mode = %d", &intValue) == 1) {
-            xrDLSSSlotMode = intValue;
-            continue;
-        }
-        if (sscanf_s(line, "xr_dlss_log_stride=%d", &intValue) == 1 ||
-            sscanf_s(line, "xr_dlss_log_stride = %d", &intValue) == 1) {
-            xrDLSSLogStride = intValue;
-            continue;
-        }
-        if (sscanf_s(line, "xr_dlss_res_override=%d", &intValue) == 1 ||
-            sscanf_s(line, "xr_dlss_res_override = %d", &intValue) == 1) {
-            xrDLSSResOverride = intValue;
             continue;
         }
         if (sscanf_s(line, "first_launch=%d", &intValue) == 1 ||
@@ -760,10 +725,6 @@ static void PollLiveControls() {
         g_liveControls.xrMenuFov != xrMenuFov ||
         g_liveControls.xrMenuFollowDeg != xrMenuFollowDeg ||
         g_liveControls.xr3DofMovement != xr3DofMovement ||
-        g_liveControls.xrDLSSMatrixHook != xrDLSSMatrixHook ||
-        g_liveControls.xrDLSSSlotMode != xrDLSSSlotMode ||
-        g_liveControls.xrDLSSLogStride != xrDLSSLogStride ||
-        g_liveControls.xrDLSSResOverride != xrDLSSResOverride ||
         g_liveControls.xrFirstLaunch != xrFirstLaunch ||
         g_liveControls.xrMotionPredictMs != xrMotionPredictMs ||
         g_liveControls.xrStereoScale != xrStereoScale ||
@@ -787,10 +748,6 @@ static void PollLiveControls() {
     g_liveControls.xrMenuFov = xrMenuFov;
     g_liveControls.xrMenuFollowDeg = xrMenuFollowDeg;
     g_liveControls.xr3DofMovement = xr3DofMovement;
-    g_liveControls.xrDLSSMatrixHook = xrDLSSMatrixHook;
-    g_liveControls.xrDLSSSlotMode = xrDLSSSlotMode;
-    g_liveControls.xrDLSSLogStride = xrDLSSLogStride > 0 ? xrDLSSLogStride : 0;
-    g_liveControls.xrDLSSResOverride = xrDLSSResOverride != 0 ? 1 : 0;
     g_liveControls.xrFirstLaunch = xrFirstLaunch != 0 ? 1 : 0;
     g_liveControls.xrMotionPredictMs = xrMotionPredictMs >= 0.0f ? xrMotionPredictMs : 0.0f;
     g_liveControls.xrStereoScale = xrStereoScale < 0.0f ? 0.0f : (xrStereoScale > 10.0f ? 10.0f : xrStereoScale);
@@ -838,8 +795,8 @@ static void PollLiveControls() {
 
 
     if (changed && g_verboseLog) {
-        Log("Live controls updated: xr_head_offset=(%.4f,%.4f,%.4f) xr_recenter=%d xr_mono_submit=%d xr_force_fov=%.3f xr_menu_rect=%d xr_menu_fov=%.3f xr_3dof_movement=%d xr_dlss_matrix_hook=%d xr_dlss_slot_mode=%d xr_dlss_log_stride=%d xr_dlss_res_override=%d xr_motion_predict_ms=%.2f xr_stereo_scale=%.3f xr_render_pose_submit=%d xr_runtime=%d\n",
-            g_liveControls.xrHeadOffsetX, g_liveControls.xrHeadOffsetY, g_liveControls.xrHeadOffsetZ, g_liveControls.xrRecenter, g_liveControls.xrMonoSubmit, g_liveControls.xrForceFov, g_liveControls.xrMenuRect, g_liveControls.xrMenuFov, g_liveControls.xr3DofMovement, g_liveControls.xrDLSSMatrixHook, g_liveControls.xrDLSSSlotMode, g_liveControls.xrDLSSLogStride, g_liveControls.xrDLSSResOverride, g_liveControls.xrMotionPredictMs, g_liveControls.xrStereoScale, g_liveControls.xrRenderPoseSubmit, g_liveControls.xrRuntime);
+        Log("Live controls updated: xr_head_offset=(%.4f,%.4f,%.4f) xr_recenter=%d xr_mono_submit=%d xr_force_fov=%.3f xr_menu_rect=%d xr_menu_fov=%.3f xr_3dof_movement=%d xr_motion_predict_ms=%.2f xr_stereo_scale=%.3f xr_render_pose_submit=%d xr_runtime=%d\n",
+            g_liveControls.xrHeadOffsetX, g_liveControls.xrHeadOffsetY, g_liveControls.xrHeadOffsetZ, g_liveControls.xrRecenter, g_liveControls.xrMonoSubmit, g_liveControls.xrForceFov, g_liveControls.xrMenuRect, g_liveControls.xrMenuFov, g_liveControls.xr3DofMovement, g_liveControls.xrMotionPredictMs, g_liveControls.xrStereoScale, g_liveControls.xrRenderPoseSubmit, g_liveControls.xrRuntime);
         if (g_liveControls.xrRuntime != 0) {
             Log("Live controls: xr_runtime=%d will apply on next startup before OpenXR init.\n", g_liveControls.xrRuntime);
         }
@@ -858,10 +815,6 @@ static LiveControlsUiState MakeLiveControlsUiState() {
     state.xrMenuFov = g_liveControls.xrMenuFov;
     state.xrMenuFollowDeg = g_liveControls.xrMenuFollowDeg;
     state.xr3DofMovement = g_liveControls.xr3DofMovement;
-    state.xrDLSSMatrixHook = g_liveControls.xrDLSSMatrixHook;
-    state.xrDLSSSlotMode = g_liveControls.xrDLSSSlotMode;
-    state.xrDLSSLogStride = g_liveControls.xrDLSSLogStride;
-    state.xrDLSSResOverride = g_liveControls.xrDLSSResOverride;
     state.xrFirstLaunch = g_liveControls.xrFirstLaunch;
     state.xrMotionPredictMs = g_liveControls.xrMotionPredictMs;
     state.xrStereoScale = g_liveControls.xrStereoScale;
@@ -909,10 +862,6 @@ static void PersistLiveControlsUiState(const LiveControlsUiState& state) {
     fprintf(file, "xr_menu_fov=%.3f\n", state.xrMenuFov);
     fprintf(file, "xr_menu_follow_deg=%.3f\n", state.xrMenuFollowDeg >= 5.0f ? state.xrMenuFollowDeg : 60.0f);
     fprintf(file, "xr_3dof_movement=%d\n", state.xr3DofMovement != 0 ? 1 : 0);
-    fprintf(file, "xr_dlss_matrix_hook=%d\n", state.xrDLSSMatrixHook != 0 ? 1 : 0);
-    fprintf(file, "xr_dlss_slot_mode=%d\n", state.xrDLSSSlotMode);
-    fprintf(file, "xr_dlss_log_stride=%d\n", state.xrDLSSLogStride);
-    fprintf(file, "xr_dlss_res_override=%d\n", state.xrDLSSResOverride != 0 ? 1 : 0);
     // Not a control, but it MUST be written back: this function rewrites the whole file, so
     // leaving the key out would drop it, and the next launch would read the default 1 and
     // re-install the shipped settings over whatever the player had just changed.
@@ -977,10 +926,6 @@ extern "C" void SetLiveControlsUiState(const LiveControlsUiState* state, int per
     g_liveControls.xrMenuFov = state->xrMenuFov > 1.0f ? state->xrMenuFov : 65.0f;
     g_liveControls.xrMenuFollowDeg = (state->xrMenuFollowDeg >= 5.0f && state->xrMenuFollowDeg <= 90.0f) ? state->xrMenuFollowDeg : 60.0f;
     g_liveControls.xr3DofMovement = state->xr3DofMovement != 0 ? 1 : 0;
-    g_liveControls.xrDLSSMatrixHook = state->xrDLSSMatrixHook != 0 ? 1 : 0;
-    g_liveControls.xrDLSSSlotMode = state->xrDLSSSlotMode;
-    g_liveControls.xrDLSSLogStride = state->xrDLSSLogStride > 0 ? state->xrDLSSLogStride : 0;
-    g_liveControls.xrDLSSResOverride = state->xrDLSSResOverride != 0 ? 1 : 0;
     g_liveControls.xrFirstLaunch = state->xrFirstLaunch != 0 ? 1 : 0;
     g_liveControls.xrMotionPredictMs = state->xrMotionPredictMs >= 0.0f ? state->xrMotionPredictMs : 0.0f;
     g_liveControls.xrStereoScale = state->xrStereoScale < 0.0f ? 0.0f : (state->xrStereoScale > 10.0f ? 10.0f : state->xrStereoScale);
@@ -1268,63 +1213,11 @@ static UINT GetForcedWindowWidthValue() {
     return GetForcedRenderWidthValue();
 }
 
-// Per-eye display aspect (width/height) the OpenXR runtime recommends. Quest 3 /
-// Pimax etc. are TALLER than wide (~0.94); Pico is ~square (~1.0). Used to render
-// at the lens aspect so the game derives the CORRECT vertical FOV (otherwise a
-// square render makes VFOV == HFOV instead of the runtime VFOV, which reads as a
-// vertical zoom / "world too big"). Returns 0 if unknown.
-static float GetDisplayAspectWoverH() {
-    uint32_t w = 0, h = 0;
-    if (OpenXRManager::Get().GetRecommendedRenderTargetSize(&w, &h) && w > 0 && h > 0) {
-        return static_cast<float>(w) / static_cast<float>(h);
-    }
-    return 0.0f;
-}
-
-/*static float GetDisplayAspectWoverH() {
-    // Usa i valori del FOV già calcolati dal runtime
-    float hfovDeg = OpenXRManager::Get().GetRuntimeHorizontalFovDeg();
-    float vfovDeg = OpenXRManager::Get().GetRuntimeVerticalFovDeg();
-    
-    if (hfovDeg > 1.0f && vfovDeg > 1.0f) {
-        float hfovRad = hfovDeg * 3.1415926535f / 180.0f;
-        float vfovRad = vfovDeg * 3.1415926535f / 180.0f;
-        float aspect = tanf(hfovRad * 0.5f) / tanf(vfovRad * 0.5f);
-        if (aspect > 0.05f && aspect < 20.0f) {
-            return aspect;
-        }
-    }
-    
-    // Fallback: usa l'aspect ratio della risoluzione raccomandata
-    uint32_t w = 0, h = 0;
-    if (OpenXRManager::Get().GetRecommendedRenderTargetSize(&w, &h) && w > 0 && h > 0) {
-        return static_cast<float>(w) / static_cast<float>(h);
-    }
-    return 0.0f;
-}*/
-
-
 static UINT GetForcedWindowHeightValue() {
     if (g_launcherHeight > 0) {
         return static_cast<UINT>(g_launcherHeight);
     }
     return GetForcedRenderHeightValue();
-}
-
-// The RENDER-target height to force: chosen width scaled to the runtime per-eye
-// aspect, so the game's internal render matches the lens shape and derives the
-// CORRECT vertical FOV. A square render (height == width) makes VFOV == HFOV
-// instead of the runtime VFOV -> vertical zoom / "world too big". On a ~square HMD
-// (Pico, aspect ~1.0) this equals the width = no change. Only the RENDER override
-// uses this; window/swapchain getters keep the launcher value.
-extern "C" UINT GetForcedRenderHeightForAspect() {
-    const UINT width = GetForcedWindowWidthValue();
-    const float aspect = GetDisplayAspectWoverH();
-    if (width > 0 && aspect > 0.05f && aspect < 20.0f) {
-        const UINT h = static_cast<UINT>(static_cast<float>(width) / aspect + 0.5f);
-        if (h > 0) return h;
-    }
-    return GetForcedWindowHeightValue();
 }
 
 // UNUSED since the DLSS resolution override went quiet -- that was its last caller, and the name
@@ -1916,14 +1809,6 @@ static volatile uintptr_t g_settingsResPtr = 0;
 static volatile uintptr_t g_dlssResPtr = 0;
 static uint64_t g_settingsResHits = 0;
 static uint64_t g_dlssResHits = 0;
-static volatile uint64_t g_dlssMatricesHits = 0;
-static volatile uintptr_t g_dlssMatricesThis = 0;
-static volatile uintptr_t g_dlssMatricesState = 0;
-static volatile uint32_t g_dlssMatricesSlot = 0;
-static volatile uint32_t g_dlssMatricesAdjustedSlot = 0;
-static volatile int g_dlssMatricesEye = -1;
-static uintptr_t g_dlssMatricesHookSite = 0;
-static uintptr_t g_dlssMatricesCallTarget = 0;
 
 static float* GetShotShared();  // shared-mem accessor (defined below)
 
@@ -1934,8 +1819,10 @@ static float* GetShotShared();  // shared-mem accessor (defined below)
 // our square-resolution override — let the game use its real 16:9 resolution for
 // the map's UI projection so pins track the background correctly.
 static void ApplySettingsResolutionOverride(uintptr_t settingsPtr) {
+    // Both straight from the launcher. The aspect-derived variant that used to sit here is
+    // gone with the DLSS overrides -- nothing may re-derive a size from the runtime's
+    // recommended render target any more; that is what cost 3.4 degrees of vertical field.
     const UINT forcedWidth = GetForcedWindowWidthValue();
-    //const UINT forcedHeight = GetForcedRenderHeightForAspect();
     const UINT forcedHeight = GetForcedWindowHeightValue();
 
     if (!settingsPtr || forcedWidth == 0 || forcedHeight == 0) {
@@ -1969,72 +1856,14 @@ static void ApplySettingsResolutionOverride(uintptr_t settingsPtr) {
     WriteU32Safe(settingsPtr + 0x88, forcedHeight);
 }
 
-// OFF BY DEFAULT since 2026-07-31, because it was breaking MAIN's DLSS outright.
-//
-// This never was a "DLSS resolution struct". The site it rides on is at RVA 0x4E46E9, which is
-// +0x449 INTO sub_1404E42A0 -- the engine's per-view DLSS render-res compute, the same function
-// sync_stereo.cpp hooks as Detour_RenderRes. Its argument is &view[0x34], and that sub-struct is
-// mapped there field by field:
-//
-//     +0x00 renderW   +0x04 renderH   +0x08/+0x0C prevW/H
-//     +0x10/+0x14 renderW duplicates  +0x18/+0x1C renderH duplicates
-//     +0x20 targetW   +0x24 targetH   +0x30 accumulator
-//
-// So the four instructions we detour are the engine's scaled branch storing the HEIGHT:
-// `mov [rbx+0x30], r14` (accum = 0) then `mov [rbx+4]/[rbx+0x18]/[rbx+0x1C], eax` -- renderH and
-// its two duplicates, all from the same freshly computed target x DLSS-scale.
-//
-// And we were stamping the full launcher height over all three, immediately after. renderW at
-// +0x00 we never touched, so it kept the engine's scaled value. Measured on a 2560x2560 launcher
-// with Balanced (0.58): MAIN came out **1485 x 2560** -- width scaled, height at native. There is
-// no DLSS preset with that shape; it is our own write, exactly.
-//
-// VRCAM escaped it by accident: Detour_RenderRes rewrites both axes AFTER the original returns
-// (p[0]/p[4]/p[5] and p[1]/p[6]/p[7]), which undoes our stomp. Hence the split the user spotted --
-// vrcam a coherent 1418x1418 (2444 x 0.58), main the impossible 1485x2560.
-//
-// The engine needs no help here: it derives renderW/renderH from targetW/targetH and the quality
-// factor by itself. The override is AER-era, from when the port had to keep alternate-eye frames
-// and DLSS agreeing about frame size. Kept rather than deleted -- flip xr_dlss_res_override=1 in
-// vrport.ini or tick the overlay box to get it back live -- but it should stay off.
-static void ApplyDLSSResolutionOverride(uintptr_t dlssPtr) {
-    if (g_liveControls.xrDLSSResOverride == 0) {
-        return;
-    }
-
-    const UINT forcedWidth = GetForcedWindowWidthValue();
-    const UINT forcedHeight = GetForcedRenderHeightForAspect();
-    if (!dlssPtr || forcedWidth == 0 || forcedHeight == 0) {
-        return;
-    }
-
-    // World map open? Suspend the override (same gate as Settings — see above).
-    {
-        uint32_t mapFlag = 0;
-        if (float* sh = GetShotShared()) {
-            mapFlag = reinterpret_cast<volatile uint32_t*>(sh)[81];
-        }
-        if (mapFlag != 0u) {
-            return;
-        }
-    }
-
-    // The historical writes, unchanged so an A/B reproduces the old behaviour exactly. Note what
-    // they actually land on per the map above: all three are HEIGHT fields, and two of them get
-    // the WIDTH. That mislabelling is the bug, preserved here only for comparison.
-    WriteU32Safe(dlssPtr + 0x04, forcedWidth);    // renderH  <- launcher width (!)
-    WriteU32Safe(dlssPtr + 0x18, forcedWidth);    // renderH duplicate
-    WriteU32Safe(dlssPtr + 0x1C, forcedHeight);   // renderH duplicate
-}
-
+// Only the SETTINGS override is left. The DLSS one was removed 2026-08-03: it was AER-era,
+// off by default for good reason (it broke MAIN's DLSS outright), and while it sat there
+// switched off it kept a size-rederivation helper alive that later leaked into the swapchain
+// path and cost vertical field of view. A knob nobody should turn is not worth its blast radius.
 static void ApplyKnownResolutionOverrides() {
     const uintptr_t settingsPtr = g_settingsResPtr;
-    const uintptr_t dlssPtr = g_dlssResPtr;
     if (settingsPtr != 0) {
         ApplySettingsResolutionOverride(settingsPtr);
-    }
-    if (dlssPtr != 0) {
-        ApplyDLSSResolutionOverride(dlssPtr);
     }
 }
 
@@ -6387,7 +6216,6 @@ extern "C" void __fastcall OnDLSSResCallback(void* dlssPtr) {
 
     const uintptr_t prev = g_dlssResPtr;
     g_dlssResPtr = dlss;
-    ApplyDLSSResolutionOverride(dlss);
 
     // Log a state the FIRST time it is seen, not whenever it differs from the previous call.
     //
@@ -6421,10 +6249,11 @@ extern "C" void __fastcall OnDLSSResCallback(void* dlssPtr) {
         ReadU32Safe(dlss + 0x24, &targetH);
         const float sx = targetW ? static_cast<float>(renderW) / static_cast<float>(targetW) : 0.0f;
         const float sy = targetH ? static_cast<float>(renderH) / static_cast<float>(targetH) : 0.0f;
-        Log("DLSSRes hook: ptr=%p render=%ux%u target=%ux%u scale=%.3f/%.3f override=%s\n",
+        // Read-only now. The override this used to report on is gone, so the line reports what
+        // the ENGINE decided and nothing else -- which is all it was ever useful for.
+        Log("DLSSRes hook: ptr=%p render=%ux%u target=%ux%u scale=%.3f/%.3f\n",
             reinterpret_cast<void*>(dlss),
-            renderW, renderH, targetW, targetH, sx, sy,
-            g_liveControls.xrDLSSResOverride ? "ON (writes launcher dims over renderH)" : "off");
+            renderW, renderH, targetW, targetH, sx, sy);
     }
 }
 
@@ -6499,333 +6328,6 @@ bool InstallDLSSResHook() {
     for (int i = 5; i < replaceLen; ++i) found[i] = 0x90;
     VirtualProtect(found, replaceLen, oldProtect, &oldProtect);
     FlushInstructionCache(GetCurrentProcess(), found, replaceLen);
-    return true;
-}
-
-static void LogDLSSMatricesStateWindow(uintptr_t state) {
-    if (!state) return;
-
-    Log("DLSSMatrices state fields near +0x1A0:\n");
-    for (int offset = 0x180; offset <= 0x1B0; offset += 4) {
-        char label[64];
-        sprintf_s(label, "dlssMatrix state+0x%03X", offset);
-        LogU32FloatAt(label, state + static_cast<uintptr_t>(offset));
-    }
-
-    LogVec4At("dlssMatrix state+0x140", state + 0x140);
-    LogVec4At("dlssMatrix state+0x160", state + 0x160);
-    LogVec4At("dlssMatrix state+0x180", state + 0x180);
-    LogVec4At("dlssMatrix state+0x1A0", state + 0x1A0);
-
-    if (!IsReadableAddressRange(state, 0x260)) {
-        Log("DLSSMatrices matrix scan skipped: state range is not fully readable.\n");
-        return;
-    }
-
-    int candidates = 0;
-    for (int offset = 0; offset <= 0x200; offset += 0x10) {
-        float values[16] = {};
-        if (!ReadFloatArraySafe(reinterpret_cast<const float*>(state + static_cast<uintptr_t>(offset)), values, 16)) {
-            continue;
-        }
-        if (!LooksProjectionLike(values, 16)) {
-            continue;
-        }
-
-        char prefix[96];
-        sprintf_s(prefix, "DLSSMatrices projection-like candidate state+0x%03X:", offset);
-        LogMatrix4x4(prefix, values);
-        if (++candidates >= 4) {
-            break;
-        }
-    }
-
-    if (candidates == 0) {
-        Log("DLSSMatrices: no projection-like 4x4 found in state+0x000..0x200.\n");
-    }
-}
-
-// Genera una matrice di proiezione SIMMETRICA che contiene l'intero frustum asimmetrico.
-// Questo evita il mismatch della skybox in RED Engine. Il runtime OpenXR gestirà 
-// automaticamente il display-cant (warping delle lenti) in fase di composizione.
-static void BuildSymmetricProjectionMatrix(const XrFovf& fov, float width, float height,
-                                           float nearZ, float farZ, float* outMatrix) {
-    memset(outMatrix, 0, sizeof(float) * 16);
-    
-    const float tanL = tanf(fov.angleLeft);
-    const float tanR = tanf(fov.angleRight);
-    const float tanU = tanf(fov.angleUp);
-    const float tanD = tanf(fov.angleDown);
-
-    // Calcola i tangent simmetrici massimi per racchiudere il frustum asimmetrico
-    const float maxTanH = std::max(fabsf(tanL), fabsf(tanR));
-    const float maxTanV = std::max(fabsf(tanU), fabsf(tanD));
-
-    const float symTanL = -maxTanH;
-    const float symTanR =  maxTanH;
-    const float symTanD = -maxTanV;
-    const float symTanU =  maxTanV;
-
-    outMatrix[0]  =  2.0f / (symTanR - symTanL); // X scale
-    outMatrix[5]  =  2.0f / (symTanU - symTanD); // Y scale
-    outMatrix[8]  =  0.0f;                       // X shift (0 = simmetrico, NIENTE off-axis)
-    outMatrix[9]  =  0.0f;                       // Y shift (0 = simmetrico, NIENTE off-axis)
-    outMatrix[10] = -(farZ + nearZ) / (farZ - nearZ); // Z scale
-    outMatrix[11] = -1.0f;                       // W translation
-    outMatrix[14] = -2.0f * farZ * nearZ / (farZ - nearZ); // Z translation
-}
-
-// Genera una matrice di proiezione ASIMMETRICA (off-axis).
-// Questo è FONDAMENTALE per il Quest 3: le lenti sono inclinate e il runtime 
-// si aspetta un frustum asimmetrico. NON ruotare la camera per compensare il cant.
-static void BuildAsymmetricProjectionMatrix(const XrFovf& fov, float width, float height,
-                                            float nearZ, float farZ, float* outMatrix) {
-    memset(outMatrix, 0, sizeof(float) * 16);
-    
-    const float tanL = tanf(fov.angleLeft);
-    const float tanR = tanf(fov.angleRight);
-    const float tanU = tanf(fov.angleUp);
-    const float tanD = tanf(fov.angleDown);
-
-    outMatrix[0]  =  2.0f / (tanR - tanL); // X scale
-    outMatrix[5]  =  2.0f / (tanU - tanD); // Y scale
-    
-    // Questi due valori gestiscono il "cant" delle lenti. DEVONO essere diversi da zero!
-    outMatrix[8]  =  (tanR + tanL) / (tanR - tanL); // X shift (asimmetrico)
-    outMatrix[9]  =  (tanU + tanD) / (tanU - tanD); // Y shift (asimmetrico)
-    
-    outMatrix[10] = -(farZ + nearZ) / (farZ - nearZ); // Z scale
-    outMatrix[11] = -1.0f;                            // W translation
-    outMatrix[14] = -2.0f * farZ * nearZ / (farZ - nearZ); // Z translation
-}
-
-extern "C" uint32_t __fastcall OnDLSSMatricesCallback(void* callThis, void* matrixState, uint32_t matrixSlot) {
-    uint32_t adjustedSlot = matrixSlot;
-    const int eye = OpenXRManager::Get().GetCurrentRenderEyeIndex();
-
-    if (g_liveControls.xrDLSSMatrixHook != 0) {
-        switch (g_liveControls.xrDLSSSlotMode) {
-        case 1:
-            // L/R frames from the same AER pair receive the same temporal index.
-            adjustedSlot = matrixSlot >> 1;
-            break;
-        case 2:
-            // Keep two stable slots, one per eye. This is a diagnostic history-isolation mode.
-            adjustedSlot = eye > 0 ? 1u : 0u;
-            break;
-        case 3:
-            // Freeze the DLSS matrix index to test whether temporal accumulation is the ghost source.
-            adjustedSlot = 0;
-            break;
-        default:
-            adjustedSlot = matrixSlot;
-            break;
-        }
-    }
-    g_dlssMatricesAdjustedSlot = adjustedSlot;
-
-    if (g_liveControls.xrDLSSMatrixHook == 0) {
-        return adjustedSlot;
-    }
-
-    const uint64_t hit = ++g_dlssMatricesHits;
-    const uintptr_t callThisAddr = reinterpret_cast<uintptr_t>(callThis);
-    const uintptr_t state = reinterpret_cast<uintptr_t>(matrixState);
-
-    g_dlssMatricesThis = callThisAddr;
-    g_dlssMatricesState = state;
-    g_dlssMatricesSlot = matrixSlot;
-    g_dlssMatricesEye = eye;
-
-    const int logStride = g_liveControls.xrDLSSLogStride;
-    const bool periodicLog = logStride > 0 && (hit % static_cast<uint64_t>(logStride)) == 1;
-    if (hit > 8 && !periodicLog) {
-        return adjustedSlot;
-    }
-
-    const uintptr_t returnAddr = g_dlssMatricesHookSite ? g_dlssMatricesHookSite + 14 : 0;
-    const unsigned long long siteRva = IsInGameModule(g_dlssMatricesHookSite)
-        ? static_cast<unsigned long long>(g_dlssMatricesHookSite - g_gameModuleBase)
-        : 0ULL;
-    const unsigned long long targetRva = IsInGameModule(g_dlssMatricesCallTarget)
-        ? static_cast<unsigned long long>(g_dlssMatricesCallTarget - g_gameModuleBase)
-        : 0ULL;
-
-    if (g_verboseLog) Log("DLSSMatrices hook: hit=%llu site=%p(rva=0x%llX) target=%p(rva=0x%llX) return=%p this=%p state=%p slot=%u adjusted=%u eye=%d mode=%d\n",
-        static_cast<unsigned long long>(hit),
-        reinterpret_cast<void*>(g_dlssMatricesHookSite),
-        siteRva,
-        reinterpret_cast<void*>(g_dlssMatricesCallTarget),
-        targetRva,
-        reinterpret_cast<void*>(returnAddr),
-        reinterpret_cast<void*>(callThisAddr),
-        reinterpret_cast<void*>(state),
-        matrixSlot,
-        adjustedSlot,
-        g_dlssMatricesEye,
-        g_liveControls.xrDLSSSlotMode);
-
-    if (state < 0x10000) {
-        Log("DLSSMatrices state skipped: pointer is not plausible.\n");
-        return adjustedSlot;
-    }
-
-    LogDLSSMatricesStateWindow(state);
-
-    // FIX: Inject correct VR projection matrices for DLSS/AER
-    // This is critical for temporal accumulation and optical flow to work correctly
-    if (g_liveControls.xrDLSSMatrixHook != 0 && state >= 0x10000) {
-        // Get the current eye's projection matrix from OpenXR
-        XrFovf fovLeft = {}, fovRight = {};
-        if (OpenXRManager::Get().GetCurrentEyeFov(0, &fovLeft) &&
-            OpenXRManager::Get().GetCurrentEyeFov(1, &fovRight)) {
-            
-            const int currentEye = OpenXRManager::Get().GetCurrentRenderEyeIndex();
-            const XrFovf& fov = (currentEye == 0) ? fovLeft : fovRight;
-            //const XrFovf& fov = (currentEye == 0) ? fovRight : fovLeft;
-            
-            // Build asymmetric projection matrix for this eye
-            // This must match the submit FOV exactly
-            const float width = static_cast<float>(GetForcedWindowWidthValue());
-            const float height = static_cast<float>(GetForcedRenderHeightForAspect());
-
-            float nearZ = 0.066f; // Default CP2077 near plane
-            float farZ = 10000.0f; // Far plane grande per coprire l'intera scena e le shadow cascades
-        
-            ReadFloatSafe(state + 0x1B0, &nearZ);
-            if (nearZ <= 0.0f || nearZ > 1.0f) nearZ = 0.066f;
-        
-            float projMatrix[16];
-            XrFovf lf{}, rf{};
-            if (OpenXRManager::Get().GetCurrentEyeFov(0, &lf) && OpenXRManager::Get().GetCurrentEyeFov(1, &rf)) {
-                const RuntimeFovCorrection corr = ComputeRuntimeFovCorrection(lf, rf);
-                if (corr.yawEnabled && corr.pitchEnabled) {
-                    BuildSymmetricProjectionMatrix(fov, width, height, nearZ, farZ, projMatrix);
-                } else {
-
-                    BuildSymmetricProjectionMatrix(fov, width, height, nearZ, farZ, projMatrix);
-                    //BuildAsymmetricProjectionMatrix(fov, width, height, nearZ, farZ, projMatrix);
-                }
-            }
-
-            // Inject the matrix into DLSS state
-            // Common offsets (you may need to adjust these based on your reverse engineering):
-            // Offset 0x140-0x17F: Previous frame projection
-            // Offset 0x180-0x1BF: Current frame projection  
-            // Offset 0x1C0-0x1FF: Next frame projection
-            
-            float testFov = 0.0f;
-            ReadFloatSafe(state + 0x1B0, &testFov);
-            if (testFov > 1.0f && testFov < 150.0f) { 
-                WriteFloatArraySafe(reinterpret_cast<float*>(state + 0x180), projMatrix, 16);
-                WriteFloatArraySafe(reinterpret_cast<float*>(state + 0x1C0), projMatrix, 16);
-            }
-            if (periodicLog) {
-                Log("DLSSMatrices INJECTED: eye=%d FOV=(%.2f,%.2f,%.2f,%.2f) res=%.0fx%.0f\n",
-                    currentEye,
-                    fov.angleLeft, fov.angleRight, fov.angleUp, fov.angleDown,
-                    width, height);
-                LogMatrix4x4("DLSSMatrices injected projection:", projMatrix);
-            }
-        }
-    }
-
-
-
-
-    return adjustedSlot;
-}
-
-bool InstallDLSSMatricesHook() {
-    const char* pattern = "\x48\x8B\xCB\x8B\x90\xA0\x01\x00\x00\xE8\x00\x00\x00\x00";
-    const char* mask = "xxxxxxxxxx????";
-    uint8_t* found = static_cast<uint8_t*>(FindPattern("Cyberpunk2077.exe", pattern, mask));
-    if (!found) return false;
-
-    constexpr int replaceLen = 14;
-    const int32_t relCall = *reinterpret_cast<int32_t*>(found + 10);
-    const uintptr_t callTarget = reinterpret_cast<uintptr_t>(found + replaceLen) + relCall;
-
-    void* tramp = AllocateTrampoline(found, 512);
-    if (!tramp) return false;
-
-    g_dlssMatricesHookSite = reinterpret_cast<uintptr_t>(found);
-    g_dlssMatricesCallTarget = callTarget;
-
-    uint8_t* code = static_cast<uint8_t*>(tramp);
-    int pos = 0;
-
-    // Original setup for the DLSS matrices call.
-    code[pos++] = 0x48; code[pos++] = 0x8B; code[pos++] = 0xCB; // mov rcx,rbx
-    code[pos++] = 0x8B; code[pos++] = 0x90; code[pos++] = 0xA0; code[pos++] = 0x01;
-    code[pos++] = 0x00; code[pos++] = 0x00; // mov edx,[rax+1A0h]
-
-    code[pos++] = 0x9C;
-    code[pos++] = 0x50;
-    code[pos++] = 0x51;
-    code[pos++] = 0x52;
-    code[pos++] = 0x41; code[pos++] = 0x50;
-    code[pos++] = 0x41; code[pos++] = 0x51;
-    code[pos++] = 0x41; code[pos++] = 0x52;
-    code[pos++] = 0x41; code[pos++] = 0x53;
-    code[pos++] = 0x55;
-
-    code[pos++] = 0x48; code[pos++] = 0x83; code[pos++] = 0xEC; code[pos++] = 0x40;
-    code[pos++] = 0x0F; code[pos++] = 0x11; code[pos++] = 0x04; code[pos++] = 0x24;
-    code[pos++] = 0x0F; code[pos++] = 0x11; code[pos++] = 0x4C; code[pos++] = 0x24; code[pos++] = 0x10;
-    code[pos++] = 0x0F; code[pos++] = 0x11; code[pos++] = 0x54; code[pos++] = 0x24; code[pos++] = 0x20;
-    code[pos++] = 0x0F; code[pos++] = 0x11; code[pos++] = 0x5C; code[pos++] = 0x24; code[pos++] = 0x30;
-
-    code[pos++] = 0x48; code[pos++] = 0x89; code[pos++] = 0xE5;
-    code[pos++] = 0x48; code[pos++] = 0x83; code[pos++] = 0xE4; code[pos++] = 0xF0;
-    code[pos++] = 0x48; code[pos++] = 0x83; code[pos++] = 0xEC; code[pos++] = 0x20;
-
-    code[pos++] = 0x41; code[pos++] = 0x89; code[pos++] = 0xD0; // mov r8d,edx
-    code[pos++] = 0x48; code[pos++] = 0x89; code[pos++] = 0xC2; // mov rdx,rax
-    WriteMovRaxImm64(code, pos, reinterpret_cast<uintptr_t>(OnDLSSMatricesCallback));
-    code[pos++] = 0xFF; code[pos++] = 0xD0;
-
-    code[pos++] = 0x48; code[pos++] = 0x89; code[pos++] = 0xEC;
-
-    code[pos++] = 0x0F; code[pos++] = 0x10; code[pos++] = 0x04; code[pos++] = 0x24;
-    code[pos++] = 0x0F; code[pos++] = 0x10; code[pos++] = 0x4C; code[pos++] = 0x24; code[pos++] = 0x10;
-    code[pos++] = 0x0F; code[pos++] = 0x10; code[pos++] = 0x54; code[pos++] = 0x24; code[pos++] = 0x20;
-    code[pos++] = 0x0F; code[pos++] = 0x10; code[pos++] = 0x5C; code[pos++] = 0x24; code[pos++] = 0x30;
-    code[pos++] = 0x48; code[pos++] = 0x83; code[pos++] = 0xC4; code[pos++] = 0x40;
-
-    // OVERWRITE the saved 'rdx' on the stack with our returned 'eax' (adjustedSlot)
-    // so that the upcoming 'pop rdx' puts it into the game's register!
-    // rdx is located at [rsp+28h] after the above add.
-    code[pos++] = 0x89; code[pos++] = 0x44; code[pos++] = 0x24; code[pos++] = 0x28; // mov dword ptr [rsp+28h], eax
-
-    code[pos++] = 0x5D;
-    code[pos++] = 0x41; code[pos++] = 0x5B;
-    code[pos++] = 0x41; code[pos++] = 0x5A;
-    code[pos++] = 0x41; code[pos++] = 0x59;
-    code[pos++] = 0x41; code[pos++] = 0x58;
-    code[pos++] = 0x5A;
-    code[pos++] = 0x59;
-    code[pos++] = 0x58;
-    code[pos++] = 0x9D;
-
-    WriteMovR11Imm64(code, pos, reinterpret_cast<uintptr_t>(&g_dlssMatricesAdjustedSlot));
-    code[pos++] = 0x41; code[pos++] = 0x8B; code[pos++] = 0x13; // mov edx,[r11]
-
-    // Preserve the original direct-call return address while jumping through an absolute target.
-    WriteMovR11Imm64(code, pos, reinterpret_cast<uintptr_t>(found + replaceLen));
-    code[pos++] = 0x41; code[pos++] = 0x53; // push r11
-    WriteMovR11Imm64(code, pos, callTarget);
-    code[pos++] = 0x41; code[pos++] = 0xFF; code[pos++] = 0xE3; // jmp r11
-
-    DWORD oldProtect;
-    VirtualProtect(found, replaceLen, PAGE_EXECUTE_READWRITE, &oldProtect);
-    found[0] = 0xE9;
-    *reinterpret_cast<int32_t*>(found + 1) = static_cast<int32_t>(code - (found + 5));
-    for (int i = 5; i < replaceLen; ++i) found[i] = 0x90;
-    VirtualProtect(found, replaceLen, oldProtect, &oldProtect);
-    FlushInstructionCache(GetCurrentProcess(), found, replaceLen);
-
-    Log("DLSSMatrices hook installed at %p target=%p\n", found, reinterpret_cast<void*>(callTarget));
     return true;
 }
 
@@ -7509,9 +7011,6 @@ DWORD WINAPI WorkerThread(LPVOID) {
     bool h11 = InstallDLSSResHook();
     if (g_verboseLog || !h11) Log("DLSSRes hook result: %s\n", h11 ? "SUCCESS" : "FAILED");
 
-    bool h12 = InstallDLSSMatricesHook();
-    if (g_verboseLog || !h12) Log("DLSSMatrices hook result: %s\n", h12 ? "SUCCESS" : "FAILED");
-
     if (kEnableNativeSetterTracers != 0) {
         bool h7 = InstallNativeSetterMetaWriteHook();
         if (g_verboseLog || !h7) Log("NativeSetterMetaWrite hook result: %s\n", h7 ? "SUCCESS" : "FAILED");
@@ -7629,16 +7128,6 @@ DWORD WINAPI WorkerThread(LPVOID) {
                     renderProj[8]);
             }
         }
-
-        Log("DLSSMatrices: hits=%llu, this=%p, state=%p, slot=%u, adjusted=%u, eye=%d, enabled=%d, mode=%d\n",
-            static_cast<unsigned long long>(g_dlssMatricesHits),
-            reinterpret_cast<void*>(g_dlssMatricesThis),
-            reinterpret_cast<void*>(g_dlssMatricesState),
-            g_dlssMatricesSlot,
-            g_dlssMatricesAdjustedSlot,
-            g_dlssMatricesEye,
-            g_liveControls.xrDLSSMatrixHook,
-            g_liveControls.xrDLSSSlotMode);
 
         if (g_telemetry->patchRdx != prevPatchRdx || g_telemetry->patchRsi != prevPatchRsi) {
             uintptr_t patchRdx = g_telemetry->patchRdx;

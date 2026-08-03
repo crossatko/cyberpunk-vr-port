@@ -28,7 +28,8 @@ extern "C" UINT GetForcedDisplayModeHeight();
 extern "C" UINT GetForcedWindowWidth();
 extern "C" UINT GetForcedWindowHeight();
 extern "C" int GetMenuMode();
-extern "C" UINT GetForcedRenderHeightForAspect();
+// Nothing in this file may re-derive a size: the swapchain gets the launcher's pick verbatim.
+// The helper that used to do it is gone entirely -- see HookedResizeBuffers.
 
 namespace {
 using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
@@ -1528,10 +1529,32 @@ HRESULT STDMETHODCALLTYPE HookedSetFullscreenState(IDXGISwapChain* swapChain, BO
     return originalFn ? originalFn(swapChain, FALSE, target) : DXGI_ERROR_INVALID_CALL;
 }
 
+// THE LAUNCHER'S SIZE, VERBATIM. Nothing is recomputed here.
+//
+// This used to take the width from the launcher and RE-DERIVE the height as
+// launcherWidth / (the runtime's RECOMMENDED render-target aspect), which is not the aspect
+// that matters. On a Quest 3 it is 1680/1760 = 0.95455, so a 2560x2848 pick came out as
+//
+//     ResizeBuffers override: 2560x2848 -> 2560x2682          (2560 / 0.95455 = 2681.9)
+//
+// Three things wrong with it. It contradicted the contract written on the function it called
+// ("only the RENDER override uses this; window/swapchain getters keep the launcher value").
+// It disagreed with CreateSwapChainForHwnd, which forces the launcher size, so the same
+// swapchain was created at one shape and resized to another. And the aspect it used is the
+// wrong one: the rule this port is built on is rect aspect == frustum TANGENT aspect, and for
+// a Quest 3 that is 1.072369/1.191754 = 0.89982 -- which is what the launcher's 2560x2848
+// (0.89888) already is. Recomputing replaced a correct height with a panel-shaped one and cost
+// 3.4 degrees of vertical field: the engine derives tanV = tanH / renderAspect, so 2682 gives
+// V = 96.66 while the lens wants 100.00 and 2848 gives 100.06.
+//
+// It went unnoticed because on a PICO the recommended size is near-square and so is the
+// tangent aspect, so the two agreed and this was the identity.
+//
+// Both of the other things that read that aspect -- the DLSS resolution override and the DLSS
+// projection-matrix injection -- were deleted with it, so there is no second path back in.
 HRESULT STDMETHODCALLTYPE HookedResizeBuffers(IDXGISwapChain* swapChain, UINT bufferCount, UINT width, UINT height, DXGI_FORMAT newFormat, UINT flags) {
     const UINT forcedWidth = GetForcedSwapchainWidth();
-    //const UINT forcedHeight = GetForcedSwapchainHeight();
-    const UINT forcedHeight = GetForcedRenderHeightForAspect();
+    const UINT forcedHeight = GetForcedSwapchainHeight();
 
     const UINT outWidth = forcedWidth != 0 ? forcedWidth : width;
     const UINT outHeight = forcedHeight != 0 ? forcedHeight : height;
@@ -1545,11 +1568,14 @@ HRESULT STDMETHODCALLTYPE HookedResizeBuffers(IDXGISwapChain* swapChain, UINT bu
     return originalFn ? originalFn(swapChain, bufferCount, outWidth, outHeight, newFormat, flags) : DXGI_ERROR_INVALID_CALL;
 }
 
+// Same rule as HookedResizeBuffers above, and for the same reasons: the launcher's size, verbatim.
+// The two must agree -- a swapchain that supports ResizeBuffers1 goes through this one instead, so
+// fixing only the other would leave the bug alive on exactly the runtimes that take this path.
 HRESULT STDMETHODCALLTYPE HookedResizeBuffers1(IDXGISwapChain3* swapChain, UINT bufferCount, UINT width, UINT height, DXGI_FORMAT format, UINT flags, const UINT* creationNodeMask, IUnknown* const* presentQueue) {
     const UINT forcedWidth = GetForcedSwapchainWidth();
-    //const UINT forcedHeight = GetForcedSwapchainHeight();
-    const UINT forcedHeight = GetForcedRenderHeightForAspect();
-    
+    const UINT forcedHeight = GetForcedSwapchainHeight();
+
+
     const UINT outWidth = forcedWidth != 0 ? forcedWidth : width;
     const UINT outHeight = forcedHeight != 0 ? forcedHeight : height;
     if (outWidth != width || outHeight != height) {

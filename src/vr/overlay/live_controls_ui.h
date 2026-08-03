@@ -13,10 +13,6 @@ struct LiveControlsUiState {
     float xrMenuFov;
     float xrMenuFollowDeg;
     int xr3DofMovement;
-    int xrDLSSMatrixHook;
-    int xrDLSSSlotMode;
-    int xrDLSSLogStride;
-    int xrDLSSResOverride;
     int xrFirstLaunch;      // not a control -- carried so a UI save does not drop the key
     float xrMotionPredictMs;
     float xrStereoScale;
