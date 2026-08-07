@@ -110,6 +110,16 @@ struct LiveControlsUiState {
     // camera to full head-look + head-relative movement). 0 (default) = classic
     // stick / snap-turn heading. Vehicles are unaffected either way. F10 -> VRIK tab.
     int xrPhysicalBodyRotation;
+    // WHEEL GRAB. 1 (default) = while driving, bringing a hand to where the driving
+    // animation holds the wheel and squeezing that grip hands the arm back to the
+    // animation (hand on the wheel, native finger curl); releasing the grip returns it
+    // to the controller. Per hand, independent. xrWheelRadius is how close the hand has
+    // to be, in metres, before the grip means "grab" instead of its normal action.
+    int xrWheelGrab;
+    float xrWheelRadius;
+    // Controller tilt that means full lock, degrees. 90 (default) = hands vertical, the 1:1
+    // reading of a real wheel; lower = the same wrist movement steers more.
+    float xrWheelSteerMaxDeg;
 };
 
 extern "C" void GetLiveControlsUiState(LiveControlsUiState* outState);

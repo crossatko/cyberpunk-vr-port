@@ -12,6 +12,7 @@
 #include <atomic>
 #include <MinHook.h>
 #include "vrik_solver.h"
+#include "shared_slots.h"   // slot numbering (vrshared::); src/common is an include root
 
 extern RED4ext::Vector4 g_CameraWorldPos; 
 extern int g_CalibrationBoneIndex;
@@ -906,6 +907,14 @@ static inline float VRIK_TwistAngleAbout(const float* parentModel, const float* 
     return 2.0f * std::atan2(p, rel[3]);
 }
 
+// Upper-arm REST local translation, per side (0 = right, 1 = left). Captured on the first solve
+// and used by the shoulder protraction below, which writes the upper arm's local translation
+// ABSOLUTE against it. File scope rather than a static inside VRIK_SolveArm because the wheel
+// grab has to be able to put that same rest value BACK when it hands the arm to the animation --
+// the protraction write is not reverted by anything else.
+static float g_vrikUpArmRest[2][3] = {};
+static bool  g_vrikUpArmRestCap[2] = { false, false };
+
 static inline void VRIK_SolveArm(uint8_t* boneBuf, int upperIdx, int foreIdx, int handIdx,
                                  const float* targetModel, const float* handModelRot,
                                  const float* bodyRight, const float* bodyUp, const float* bodyFwd,
@@ -948,17 +957,15 @@ static inline void VRIK_SolveArm(uint8_t* boneBuf, int upperIdx, int foreIdx, in
     float shP[3] = { sh[0], sh[1], sh[2] };
     {
         const int par = g_VRBoneParent[upperIdx];
-        static float s_upLocRest[2][3];
-        static bool  s_upLocCap[2] = { false, false };
         if (par >= 0 && par < upperIdx) {
             float* tl = reinterpret_cast<float*>(boneBuf + upperIdx * 48 + VRIK_TRANS_OFF);
-            if (!s_upLocCap[sideJ]) {
-                s_upLocRest[sideJ][0]=tl[0]; s_upLocRest[sideJ][1]=tl[1]; s_upLocRest[sideJ][2]=tl[2];
-                s_upLocCap[sideJ] = true;
+            if (!g_vrikUpArmRestCap[sideJ]) {
+                g_vrikUpArmRest[sideJ][0]=tl[0]; g_vrikUpArmRest[sideJ][1]=tl[1]; g_vrikUpArmRest[sideJ][2]=tl[2];
+                g_vrikUpArmRestCap[sideJ] = true;
             }
             // Clean base shoulder = parent FK * rest local (undo last frame's write, which
             // is already baked into g_fkPos[upperIdx]).
-            float base[3]; VRIK_QuatRotateVec(g_fkRot[par], s_upLocRest[sideJ], base);
+            float base[3]; VRIK_QuatRotateVec(g_fkRot[par], g_vrikUpArmRest[sideJ], base);
             base[0] += g_fkPos[par][0]; base[1] += g_fkPos[par][1]; base[2] += g_fkPos[par][2];
             float toT[3] = { targetModel[0]-base[0], targetModel[1]-base[1], targetModel[2]-base[2] };
             const float dist = std::sqrt(toT[0]*toT[0] + toT[1]*toT[1] + toT[2]*toT[2]);
@@ -978,9 +985,9 @@ static inline void VRIK_SolveArm(uint8_t* boneBuf, int upperIdx, int foreIdx, in
                 shP[0] = base[0] + delta[0]; shP[1] = base[1] + delta[1]; shP[2] = base[2] + delta[2];
                 float pc[4] = { -g_fkRot[par][0], -g_fkRot[par][1], -g_fkRot[par][2], g_fkRot[par][3] };
                 float ld[3]; VRIK_QuatRotateVec(pc, delta, ld);
-                tl[0] = s_upLocRest[sideJ][0] + ld[0];
-                tl[1] = s_upLocRest[sideJ][1] + ld[1];
-                tl[2] = s_upLocRest[sideJ][2] + ld[2];
+                tl[0] = g_vrikUpArmRest[sideJ][0] + ld[0];
+                tl[1] = g_vrikUpArmRest[sideJ][1] + ld[1];
+                tl[2] = g_vrikUpArmRest[sideJ][2] + ld[2];
             }
         }
     }
@@ -1848,6 +1855,430 @@ static inline void VRIK_ScaleArmBonesFromRest(uint8_t* boneBuf, uintptr_t trackB
     handT[0] = handRest[0] * foreScale;  handT[1] = handRest[1] * foreScale;  handT[2] = handRest[2] * foreScale;
 }
 
+// ============================================================================================
+// WHEEL GRAB -- give the arm back to the driving animation.
+//
+// Driving, the engine already animates both hands onto the wheel (or the handlebars): that pose
+// is sitting in the bone buffer every fresh solve, before we touch anything. So there is no
+// steering wheel to find, no vehicle bone to resolve and no per-model offset table -- the
+// reference pose IS the animation, which is why this works identically on a bike, in any car,
+// and in vehicles this port has never seen.
+//
+// Per hand, independently: bring a hand to where the animation holds the wheel, squeeze that
+// grip, and the arm is handed back to the animation (fingers included -- VRIK never writes
+// finger bones, so the native grip comes for free). Release the grip and the arm returns to the
+// controller. The other hand is unaffected, so you can hold the wheel with one hand and keep the
+// other on a gun.
+//
+// Handing an arm back means three writes must stop TOGETHER, not just the IK solve:
+//   * VRIK_SolveArm            -- the rotations
+//   * VRIK_ScaleArmBonesFromRest -- the segment lengths scaled to the player's real arm; leave
+//                                 them in and the hand lands next to the wheel, not on it
+//   * the solve cache          -- the same-tick replay would re-apply the last solved locals
+//                                 4-5x per tick and glue the arm right back where it was
+// and the two translation writes that are NOT reverted by the engine (the length scale and the
+// shoulder protraction) have to be put back to the rig's rest values on the way out.
+// ============================================================================================
+static inline void VRIK_RestoreArmRestTrans(uint8_t* boneBuf, uintptr_t trackBuf, int boneCount,
+                                            int upperIdx, int foreIdx, int handIdx, bool isLeft) {
+    float rest[3];
+    if (foreIdx >= 0 && foreIdx < VRIK_MAX_BONES
+        && VRIK_ArmRestTrans(boneBuf, trackBuf, boneCount, foreIdx, rest)) {
+        float* t = reinterpret_cast<float*>(boneBuf + foreIdx * 48 + VRIK_TRANS_OFF);
+        t[0] = rest[0]; t[1] = rest[1]; t[2] = rest[2];
+    }
+    if (handIdx >= 0 && handIdx < VRIK_MAX_BONES
+        && VRIK_ArmRestTrans(boneBuf, trackBuf, boneCount, handIdx, rest)) {
+        float* t = reinterpret_cast<float*>(boneBuf + handIdx * 48 + VRIK_TRANS_OFF);
+        t[0] = rest[0]; t[1] = rest[1]; t[2] = rest[2];
+    }
+    const int side = isLeft ? 1 : 0;
+    if (upperIdx >= 0 && upperIdx < VRIK_MAX_BONES && g_vrikUpArmRestCap[side]) {
+        float* t = reinterpret_cast<float*>(boneBuf + upperIdx * 48 + VRIK_TRANS_OFF);
+        t[0] = g_vrikUpArmRest[side][0];
+        t[1] = g_vrikUpArmRest[side][1];
+        t[2] = g_vrikUpArmRest[side][2];
+    }
+}
+
+struct VRIKWheelHand {
+    float blend       = 0.0f;   // 0 = arm IK drives the hand, 1 = animation does
+    bool  engaged     = false;  // grip held on a grab that started at the wheel
+    bool  atWheel     = false;  // controller is within the radius of the animated hand
+    bool  gripPrev    = false;
+    bool  targetValid = false;
+    float target[3]   = {};     // last solve's IK target (model space) -- the player's real hand
+    float animPos[3]  = {};     // this solve's ANIMATED hand position (model space)
+    float animRot[4]  = { 0.0f, 0.0f, 0.0f, 1.0f };
+    bool  animValid   = false;
+};
+static VRIKWheelHand g_vrikWheel[2];        // [0] = right, [1] = left
+
+// WHEEL CENTRE, model space. Needed only for a ONE-handed grab, where there is no second
+// controller to measure the tilt against. It is the midpoint of the two ANIMATED hands -- the
+// driving animation holds the wheel at 9 and 3, so their midpoint is the hub -- captured while
+// nothing is grabbed and then FROZEN for the whole grab. Frozen, because with a weapon out the
+// game switches to a one-handed driving pose, and a live midpoint would then wander off the hub
+// and take the steering with it. A rotation about the hub does not move the hub, so freezing
+// costs nothing while the pose stays two-handed either.
+static float g_vrikWheelCenter[3] = {};
+static bool  g_vrikWheelCenterValid = false;
+// Distance between the two ANIMATED hands, captured with the centre: the wheel's diameter as the
+// animation holds it. It is the reference LEVER for the steering measurement below.
+static float g_vrikWheelSpan = 0.0f;
+static float g_vrikWheelSteer = 0.0f;      // -1 .. +1, faded by the grab blend
+static float g_vrikWheelSteerDeg = 0.0f;   // the raw angle, for the overlay read-out
+// Hands level is neutral, but a hand resting on a wheel is never exactly level. Small on purpose:
+// this is only meant to swallow tremor, and every degree here is a degree of dead wheel.
+static constexpr float kWheelSteerDeadDeg = 1.5f;
+// STICK FLOOR. The game has a deadzone of its own on the left stick, so the first fifth of our
+// output steered nothing at all -- "you have to turn your hands a long way before the car reacts".
+// Once past the tremor deadband we start ABOVE that threshold, and the curve below puts the rest
+// of the useful response into the small angles where a wheel is actually worked.
+static constexpr float kWheelSteerOutFloor = 0.18f;
+// <1 = more output for small angles. 0.7 makes 10 deg of tilt worth ~30% lock instead of ~10%.
+static constexpr float kWheelSteerCurve = 0.7f;
+// A lever shorter than this has no usable direction -- a hand right on the hub swings through
+// every angle on a centimetre of tremor.
+static constexpr float kWheelMinLever = 0.04f;
+
+// Engage slower than release: reaching for the wheel is deliberate, letting go is a reaction.
+static constexpr float kWheelEngageSec  = 0.16f;
+static constexpr float kWheelReleaseSec = 0.11f;
+// Above this the arm is handed over completely (nothing written at all). Below 1 the solve still
+// runs, with the target blended toward the animated hand -- that is what makes it a movement
+// instead of a snap.
+static constexpr float kWheelFullBlend  = 0.995f;
+
+static inline void VRIK_WheelCaptureAnim(int hand, int handIdx) {
+    VRIKWheelHand& w = g_vrikWheel[hand];
+    w.animValid = false;
+    if (handIdx < 0 || handIdx >= VRIK_MAX_BONES) return;
+    w.animPos[0] = g_fkPos[handIdx][0];
+    w.animPos[1] = g_fkPos[handIdx][1];
+    w.animPos[2] = g_fkPos[handIdx][2];
+    w.animRot[0] = g_fkRot[handIdx][0];
+    w.animRot[1] = g_fkRot[handIdx][1];
+    w.animRot[2] = g_fkRot[handIdx][2];
+    w.animRot[3] = g_fkRot[handIdx][3];
+    w.animValid = true;
+}
+
+// RAW slot read. SharedPose() only covers [0..126] -- that is the size of the seqlock snapshot
+// (g_handsStable[128]) and asking it for [155] or [162] reads off the end of that array. Every
+// slot this feature uses except the right grip lives above the snapshot, so it reads the mapping
+// directly, like every other high-slot consumer in this file.
+static inline float VRIK_WheelSlot(int i) {
+    return (g_pSharedHands && i >= 0 && i < vrshared::kSlotCount) ? g_pSharedHands[i] : 0.0f;
+}
+
+// One state update per FRESH solve. The proximity test uses the target the previous solve built
+// (one tick old): the target for this solve is not computed until well inside the arm block, and
+// a tick of lag on a 28 cm radius is not a thing a hand can outrun.
+static inline void VRIK_WheelUpdate(float dtSec) {
+    const bool enabled = (VRIK_WheelSlot(vrshared::kWheelEnable) > 0.5f);
+    const bool driving = (VRIK_WheelSlot(vrshared::kIsDriving) > 0.5f);
+    float radius = VRIK_WheelSlot(vrshared::kWheelRadius);
+    if (!(radius > 0.05f) || radius > 1.0f) radius = 0.28f;   // also catches a zeroed block
+    if (dtSec < 0.0f) dtSec = 0.0f;
+    if (dtSec > 0.10f) dtSec = 0.10f;
+
+    int armedMask = 0;
+    for (int h = 0; h < 2; ++h) {
+        VRIKWheelHand& w = g_vrikWheel[h];
+        // [49] is the right grip, [155] the left -- both binary, both published every XInput
+        // poll by the stereo plugin, neither inside the hands seqlock.
+        const bool grip = (h == 0) ? (VRIK_WheelSlot(49) > 0.5f)
+                                   : (VRIK_WheelSlot(vrshared::kLeftGripPressed) > 0.5f);
+        w.atWheel = false;
+        if (enabled && driving && w.animValid && w.targetValid) {
+            const float dx = w.target[0] - w.animPos[0];
+            const float dy = w.target[1] - w.animPos[1];
+            const float dz = w.target[2] - w.animPos[2];
+            w.atWheel = (dx*dx + dy*dy + dz*dz) <= (radius * radius);
+        }
+
+        if (!enabled || !driving) {
+            w.engaged = false;
+        } else if (w.engaged) {
+            w.engaged = grip;                       // the grip alone holds it; let go and it ends
+        } else if (grip && !w.gripPrev && w.atWheel) {
+            w.engaged = true;                       // fresh press AT the wheel, never a held grip
+        }
+        w.gripPrev = grip;
+
+        const float step = dtSec / (w.engaged ? kWheelEngageSec : kWheelReleaseSec);
+        if (w.engaged) { w.blend += step; if (w.blend > 1.0f) w.blend = 1.0f; }
+        else           { w.blend -= step; if (w.blend < 0.0f) w.blend = 0.0f; }
+
+        // ARMED = the grip is not a gameplay button right now. Raised on proximity alone, before
+        // any press, so the input side never leaks the first frame of the squeeze.
+        if (w.atWheel || w.engaged)
+            armedMask |= (h == 0) ? vrshared::kWheelArmedRightBit : vrshared::kWheelArmedLeftBit;
+    }
+
+    // WHEEL CENTRE. Track it while nothing is held; freeze it for the duration of a grab.
+    if (!g_vrikWheel[0].engaged && !g_vrikWheel[1].engaged) {
+        if (g_vrikWheel[0].animValid && g_vrikWheel[1].animValid) {
+            const float sx = g_vrikWheel[0].animPos[0] - g_vrikWheel[1].animPos[0];
+            const float sy = g_vrikWheel[0].animPos[1] - g_vrikWheel[1].animPos[1];
+            const float sz = g_vrikWheel[0].animPos[2] - g_vrikWheel[1].animPos[2];
+            const float span = std::sqrt(sx*sx + sy*sy + sz*sz);
+            // A one-handed driving pose (weapon out) collapses the two animated hands together;
+            // that midpoint is not the hub and that span is not the wheel. Keep the last good one.
+            if (span > 0.15f) {
+                g_vrikWheelCenter[0] = (g_vrikWheel[0].animPos[0] + g_vrikWheel[1].animPos[0]) * 0.5f;
+                g_vrikWheelCenter[1] = (g_vrikWheel[0].animPos[1] + g_vrikWheel[1].animPos[1]) * 0.5f;
+                g_vrikWheelCenter[2] = (g_vrikWheel[0].animPos[2] + g_vrikWheel[1].animPos[2]) * 0.5f;
+                g_vrikWheelSpan = span;
+                g_vrikWheelCenterValid = true;
+            }
+        }
+        // Nothing held -> nothing to steer with. Cleared here rather than in the steering pass
+        // so it is also cleared on the solves where the arm blocks never run.
+        g_vrikWheelSteer = 0.0f;
+        g_vrikWheelSteerDeg = 0.0f;
+    }
+
+    if (g_pSharedHands) {
+        g_pSharedHands[vrshared::kWheelBlendRight] = g_vrikWheel[0].blend;
+        g_pSharedHands[vrshared::kWheelBlendLeft]  = g_vrikWheel[1].blend;
+        g_pSharedHands[vrshared::kWheelArmedMask]  = static_cast<float>(armedMask);
+        g_pSharedHands[vrshared::kWheelSteer]      = g_vrikWheelSteer;
+        g_pSharedHands[vrshared::kWheelSteerDeg]   = g_vrikWheelSteerDeg;
+    }
+}
+
+// STEERING. Runs after both arm blocks, where the body axes exist and both controller targets
+// have been refreshed this solve.
+//
+// The angle is the tilt of the line through the two controllers, measured in the body's
+// right/up plane (the plane the wheel is seen in; the forward component is dropped, so leaning
+// a hand toward or away from the dash does not steer).
+//
+//   both hands   v = right controller - left controller
+//   right only   v = right controller - wheel centre
+//   left  only   v = wheel centre - left controller
+//
+// all three of which are the same vector for the same wheel rotation, which is why one formula
+// covers the three cases. Sign: turning a wheel LEFT raises the right hand and drops the left,
+// so a positive up-component means steer left -- hence the negation.
+//   left hand under / right hand over, vertical  = -90 deg = full left
+//   left hand over  / right hand under, vertical = +90 deg = full right
+static inline void VRIK_WheelSteerUpdate(const float* bodyRight, const float* bodyUp) {
+    const bool eR = g_vrikWheel[0].engaged, eL = g_vrikWheel[1].engaged;
+    if (!eR && !eL) return;   // VRIK_WheelUpdate already zeroed it
+
+    // Every path below ends here, zero included: a controller that stops reporting mid-corner
+    // must straighten the wheel, not leave the car turning on the last angle it saw.
+    float out = 0.0f, deg = 0.0f;
+    bool  haveV = false;
+    float v[3] = { 0.0f, 0.0f, 0.0f };
+    // The lever this measurement SHOULD have, taken from the animation: the full span between the
+    // hands with two, the radius to the hub with one. Your hands are not on a physical rim, so
+    // nothing stops them from collapsing toward each other or onto the hub -- and a short lever
+    // turns a centimetre of hand movement into tens of degrees. That is the one-handed
+    // hypersensitivity: same angle rule, a fraction of the arm to measure it on.
+    float nominal = 0.0f;
+
+    if (eR && eL) {
+        if (g_vrikWheel[0].targetValid && g_vrikWheel[1].targetValid) {
+            v[0] = g_vrikWheel[0].target[0] - g_vrikWheel[1].target[0];
+            v[1] = g_vrikWheel[0].target[1] - g_vrikWheel[1].target[1];
+            v[2] = g_vrikWheel[0].target[2] - g_vrikWheel[1].target[2];
+            nominal = g_vrikWheelSpan;
+            haveV = true;
+        }
+    } else if (g_vrikWheelCenterValid) {
+        const int hIdx = eR ? 0 : 1;
+        if (g_vrikWheel[hIdx].targetValid) {
+            // Right hand measures OUT from the hub, left hand measures IN to it -- that is what
+            // puts "right hand above the centre" and "left hand below the centre" on one sign.
+            const float s = eR ? 1.0f : -1.0f;
+            v[0] = (g_vrikWheel[hIdx].target[0] - g_vrikWheelCenter[0]) * s;
+            v[1] = (g_vrikWheel[hIdx].target[1] - g_vrikWheelCenter[1]) * s;
+            v[2] = (g_vrikWheel[hIdx].target[2] - g_vrikWheelCenter[2]) * s;
+            nominal = g_vrikWheelSpan * 0.5f;   // hub to rim
+            haveV = true;
+        }
+    }
+
+    if (haveV) {
+        const float hx = VRIK_Dot3(v, bodyRight);
+        const float y  = VRIK_Dot3(v, bodyUp);
+        const float lever = std::sqrt(hx*hx + y*y);
+        if (lever > kWheelMinLever) {
+            float maxDeg = VRIK_WheelSlot(vrshared::kWheelSteerMaxDeg);
+            if (!(maxDeg >= 30.0f) || maxDeg > 120.0f) maxDeg = 90.0f;
+
+            deg = -std::atan2(y, hx) * 57.29577951f;
+
+            // LEVER CORRECTION. Never more than 1: at the animation's own geometry the rule is
+            // exactly as specified (hands vertical = full lock). Held closer together than that,
+            // the angle counts proportionally less -- which is the same as saying the steering
+            // follows how far the hands MOVED, not how far they swung around a point they may be
+            // sitting almost on top of.
+            float lev = 1.0f;
+            if (nominal > 0.15f) {
+                lev = lever / nominal;
+                if (lev > 1.0f) lev = 1.0f;
+            }
+
+            float n = (std::fabs(deg) - kWheelSteerDeadDeg) / (maxDeg - kWheelSteerDeadDeg);
+            if (n < 0.0f) n = 0.0f;
+            if (n > 1.0f) n = 1.0f;
+            n *= lev;
+            if (n > 0.0f) {
+                // Curve first, then lift clear of the game's own stick deadzone.
+                n = std::pow(n, kWheelSteerCurve);
+                out = kWheelSteerOutFloor + (1.0f - kWheelSteerOutFloor) * n;
+                if (out > 1.0f) out = 1.0f;
+                if (deg < 0.0f) out = -out;
+            }
+
+            // Fade with the grab itself, so letting go releases the steering over the same
+            // ~0.1 s the hand takes to come back rather than dropping it in one frame.
+            float blend = g_vrikWheel[0].blend > g_vrikWheel[1].blend
+                        ? g_vrikWheel[0].blend : g_vrikWheel[1].blend;
+            if (blend > 1.0f) blend = 1.0f;
+            out *= blend;
+        }
+    }
+
+    g_vrikWheelSteer = out;
+    g_vrikWheelSteerDeg = deg;
+    if (g_pSharedHands) {
+        g_pSharedHands[vrshared::kWheelSteer]    = g_vrikWheelSteer;
+        g_pSharedHands[vrshared::kWheelSteerDeg] = g_vrikWheelSteerDeg;
+    }
+}
+
+// Blend the IK target toward the animated hand. At blend 0 this is a no-op; the caller skips the
+// solve entirely once the blend is full, so this only ever runs on the way in and out.
+static inline void VRIK_WheelBlendTarget(int hand, float* target, float* handRot) {
+    const VRIKWheelHand& w = g_vrikWheel[hand];
+    if (w.blend <= 0.0f || !w.animValid) return;
+    const float b = w.blend;
+    target[0] += (w.animPos[0] - target[0]) * b;
+    target[1] += (w.animPos[1] - target[1]) * b;
+    target[2] += (w.animPos[2] - target[2]) * b;
+    float from[4] = { handRot[0], handRot[1], handRot[2], handRot[3] };
+    float to[4]   = { w.animRot[0], w.animRot[1], w.animRot[2], w.animRot[3] };
+    if (from[0]*to[0] + from[1]*to[1] + from[2]*to[2] + from[3]*to[3] < 0.0f) {
+        to[0] = -to[0]; to[1] = -to[1]; to[2] = -to[2]; to[3] = -to[3];
+    }
+    // nlerp: the two poses are close enough by construction (this only runs while the hand is
+    // travelling the last few centimetres to the wheel) that slerp would buy nothing.
+    handRot[0] = from[0] + (to[0] - from[0]) * b;
+    handRot[1] = from[1] + (to[1] - from[1]) * b;
+    handRot[2] = from[2] + (to[2] - from[2]) * b;
+    handRot[3] = from[3] + (to[3] - from[3]) * b;
+    VRIK_QuatNorm(handRot);
+}
+
+static inline void VRIK_WheelStoreTarget(int hand, const float* target) {
+    VRIKWheelHand& w = g_vrikWheel[hand];
+    w.target[0] = target[0]; w.target[1] = target[1]; w.target[2] = target[2];
+    w.targetValid = true;
+}
+
+// True once the arm is fully the animation's: no solve, no length scale, no cache entry.
+static inline bool VRIK_WheelHandsOff(int hand) {
+    return g_vrikWheel[hand].blend >= kWheelFullBlend;
+}
+
+// ============================================================================================
+// OPEN HANDS IN A CAR.
+//
+// VRIK owns the arm and the wrist and has never written a finger bone -- that is what makes the
+// native grip on the wheel free when an arm is handed over. The other side of it is that the
+// driving animation's CLOSED FISTS are on the avatar the whole time you are seated, wheel held
+// or not: hands following your controllers around the cabin with the knuckles of someone still
+// gripping a wheel that is not there.
+//
+// So the fingers need a pose of their own for the not-holding case, and the honest source for
+// one is the player: latch the finger locals while ON FOOT with empty hands -- the game's own
+// relaxed hand -- and replay them for whichever hand is not on the wheel. Nothing authored,
+// nothing hardcoded per rig, and it tracks whatever the character's idle hand actually is.
+//
+// Written on EVERY player pass (like the smoke grip, and before it, so smoking still wins) --
+// the 4-5 passes per tick must leave the finger bones identical or they flicker.
+// ============================================================================================
+static float g_vrikRelaxFingerRot[2][32][4] = {};
+static bool  g_vrikRelaxFingerHave[2] = { false, false };
+
+static inline void VRIK_WheelFingers(uint8_t* boneBuf) {
+    if (!boneBuf || !g_pSharedHands) return;
+    const bool inVehicle = (SharedPose(31) > 0.5f);
+    // A weapon is held with the fingers the weapon needs -- ours would open the hand around the
+    // grip, and on foot it would be what we latched as "relaxed".
+    const bool weapon = (VRIK_WheelSlot(144) > 0.5f);
+
+    for (int h = 0; h < 2; ++h) {
+        const int   count = (h == 0) ? g_VRSmokeFingerCount : g_VRSmokeFingerCountL;
+        const int*  idx   = (h == 0) ? g_VRSmokeFingerIdx   : g_VRSmokeFingerIdxL;
+        if (count <= 0) continue;
+        // Smoking owns this hand's fingers when it is holding something.
+        const bool smoking = (h == 0) ? (g_VRSmokeFingerActive != 0) : (g_VRSmokeFingerActiveL != 0);
+        const bool grip = (h == 0) ? (VRIK_WheelSlot(49) > 0.5f)
+                                   : (VRIK_WheelSlot(vrshared::kLeftGripPressed) > 0.5f);
+
+        if (!inVehicle) {
+            // CAPTURE. Empty-handed and not squeezing -- a squeezed grip is usually a fist, and
+            // latching that would put it back on in the car.
+            if (!weapon && !smoking && !grip) {
+                for (int k = 0; k < count && k < 32; ++k) {
+                    const int bi = idx[k];
+                    if (bi < 0 || bi >= VRIK_MAX_BONES) continue;
+                    const float* q = reinterpret_cast<const float*>(boneBuf + bi * 48 + VRIK_ROT_OFF);
+                    g_vrikRelaxFingerRot[h][k][0] = q[0]; g_vrikRelaxFingerRot[h][k][1] = q[1];
+                    g_vrikRelaxFingerRot[h][k][2] = q[2]; g_vrikRelaxFingerRot[h][k][3] = q[3];
+                }
+                g_vrikRelaxFingerHave[h] = true;
+            }
+            continue;
+        }
+
+        // APPLY. Seated, this hand not (mostly) on the wheel, nothing else claiming the fingers.
+        // The switch is at half the grab blend: past that the hand is close enough to the wheel
+        // that the animation's grip is the pose you want to see closing around it.
+        if (!weapon && !smoking && g_vrikRelaxFingerHave[h] && g_vrikWheel[h].blend < 0.5f) {
+            for (int k = 0; k < count && k < 32; ++k) {
+                const int bi = idx[k];
+                if (bi < 0 || bi >= VRIK_MAX_BONES) continue;
+                float* q = reinterpret_cast<float*>(boneBuf + bi * 48 + VRIK_ROT_OFF);
+                q[0] = g_vrikRelaxFingerRot[h][k][0]; q[1] = g_vrikRelaxFingerRot[h][k][1];
+                q[2] = g_vrikRelaxFingerRot[h][k][2]; q[3] = g_vrikRelaxFingerRot[h][k][3];
+            }
+        }
+    }
+}
+
+// Drop the whole thing, published state included. VRIK_WheelUpdate only runs inside a fresh
+// mode-4 solve, so switching tracking off while a hand is at the wheel would otherwise leave the
+// armed mask raised -- and the left grip permanently taken out of the gamepad.
+static inline void VRIK_WheelReset() {
+    for (int h = 0; h < 2; ++h) {
+        g_vrikWheel[h].blend = 0.0f;
+        g_vrikWheel[h].engaged = false;
+        g_vrikWheel[h].atWheel = false;
+        g_vrikWheel[h].gripPrev = false;
+        g_vrikWheel[h].targetValid = false;
+        g_vrikWheel[h].animValid = false;
+    }
+    g_vrikWheelSteer = 0.0f;
+    g_vrikWheelSteerDeg = 0.0f;
+    g_vrikWheelCenterValid = false;
+    g_vrikWheelSpan = 0.0f;
+    if (g_pSharedHands) {
+        g_pSharedHands[vrshared::kWheelBlendRight] = 0.0f;
+        g_pSharedHands[vrshared::kWheelBlendLeft]  = 0.0f;
+        g_pSharedHands[vrshared::kWheelArmedMask]  = 0.0f;
+        g_pSharedHands[vrshared::kWheelSteer]      = 0.0f;
+        g_pSharedHands[vrshared::kWheelSteerDeg]   = 0.0f;
+    }
+}
+
 // Generic 2-bone limb IK (hip->knee->foot). Rotation-only writes (no stretch). The knee bends
 // toward poleDir (projected perpendicular to the hip->foot axis). Used to keep the feet planted
 // on their captured ground targets after the hips move under the HMD.
@@ -2149,6 +2580,10 @@ extern "C" inline void* Hooked_AnimPoseApply(void* a1, void* a2, void* a3, unsig
                 //     our own replayed pose.
                 //   * APPLY writes the latched locals back. Finger bones are parent-local and
                 //     untouched by VRIK, so they curl relative to the controller-driven wrist.
+                // OPEN HANDS IN A CAR. Before the smoke grip on purpose: if the smoking mod is
+                // holding something in that hand it writes after us and wins.
+                VRIK_WheelFingers(boneBuf);
+
                 if (g_VRSmokeFingerCount > 0 || g_VRSmokeCigIdx >= 0) {
                     if (g_VRSmokeFingerCapture) {
                         // Fingers: rotation only (parent-local; no translation => no skin stretch).
@@ -2612,6 +3047,30 @@ extern "C" inline void* Hooked_AnimPoseApply(void* a1, void* a2, void* a3, unsig
                     // character/camera position. dxgi publishes the flag in [31].
                     const bool vrikInVehicle = (SharedPose(31) > 0.5f);
                     VRIK_ComputeFK(boneBuf, VRIK_FKCount());
+                    // WHEEL GRAB. This FK is the pure ANIMATED pose -- nothing of ours has been
+                    // written into the buffer yet this solve -- so g_fkPos[hand] is literally
+                    // the hand the driving animation puts on the wheel. Capture it here and
+                    // nowhere else: three lines further down the segment lengths are rescaled
+                    // to the player's arm and it stops being the animation's answer.
+                    VRIK_WheelCaptureAnim(0, g_VRRightBoneIdx);
+                    VRIK_WheelCaptureAnim(1, g_VRLeftBoneIdx);
+                    {
+                        // QPC, not GetTickCount64: the tick counter moves in ~15.6 ms steps, which
+                        // over a 160 ms blend is ten of them -- the hand would step to the wheel.
+                        static int64_t s_wheelLastQpc = 0;
+                        LARGE_INTEGER qc{}, qf{};
+                        QueryPerformanceCounter(&qc);
+                        QueryPerformanceFrequency(&qf);
+                        float dt = 0.016f;
+                        if (s_wheelLastQpc != 0 && qf.QuadPart > 0) {
+                            dt = static_cast<float>(
+                                static_cast<double>(qc.QuadPart - s_wheelLastQpc) / static_cast<double>(qf.QuadPart));
+                        }
+                        s_wheelLastQpc = qc.QuadPart;
+                        VRIK_WheelUpdate(dt);
+                    }
+                    const bool wheelOffR = VRIK_WheelHandsOff(0);
+                    const bool wheelOffL = VRIK_WheelHandsOff(1);
                     if (!vrikInVehicle) {
                         VRIK_DampenTorsoWeaponPose(boneBuf);
                         VRIK_PinGirdleTranslations(boneBuf);
@@ -2621,10 +3080,26 @@ extern "C" inline void* Hooked_AnimPoseApply(void* a1, void* a2, void* a3, unsig
                     // from cached rest local translations, then scale them to the T-pose measured
                     // user arm. Do not derive length from the current weapon/stance FK pose.
                     {
-                        VRIK_ScaleArmBonesFromRest(boneBuf, trackBuf, g_VRBoneCount,
-                                                   g_VRRightForeArmIdx, g_VRRightBoneIdx, g_VRUserArmLenR);
-                        VRIK_ScaleArmBonesFromRest(boneBuf, trackBuf, g_VRBoneCount,
-                                                   g_VRLeftForeArmIdx, g_VRLeftBoneIdx, g_VRUserArmLenL);
+                        // An arm handed to the animation keeps the RIG's segment lengths: scaled
+                        // to the player's arm instead, the animation's own rotations put the hand
+                        // beside the wheel rather than on it. Put the rest translations back --
+                        // neither this scale nor the shoulder protraction is undone by the engine.
+                        if (wheelOffR) {
+                            VRIK_RestoreArmRestTrans(boneBuf, trackBuf, g_VRBoneCount,
+                                                     g_VRRightUpperArmIdx, g_VRRightForeArmIdx,
+                                                     g_VRRightBoneIdx, /*isLeft*/false);
+                        } else {
+                            VRIK_ScaleArmBonesFromRest(boneBuf, trackBuf, g_VRBoneCount,
+                                                       g_VRRightForeArmIdx, g_VRRightBoneIdx, g_VRUserArmLenR);
+                        }
+                        if (wheelOffL) {
+                            VRIK_RestoreArmRestTrans(boneBuf, trackBuf, g_VRBoneCount,
+                                                     g_VRLeftUpperArmIdx, g_VRLeftForeArmIdx,
+                                                     g_VRLeftBoneIdx, /*isLeft*/true);
+                        } else {
+                            VRIK_ScaleArmBonesFromRest(boneBuf, trackBuf, g_VRBoneCount,
+                                                       g_VRLeftForeArmIdx, g_VRLeftBoneIdx, g_VRUserArmLenL);
+                        }
                         VRIK_ComputeFK(boneBuf, VRIK_FKCount());
                     }
                     // Right-hand CONTROLLER position in model space, captured from the arm-IK
@@ -3023,7 +3498,19 @@ extern "C" inline void* Hooked_AnimPoseApply(void* a1, void* a2, void* a3, unsig
                             const float shoulderBodyR[3]= { g_VRShoulderRX, g_VRShoulderRY, g_VRShoulderRZ };
                             float armLenR = restArmLen(g_VRRightUpperArmIdx, g_VRRightForeArmIdx, g_VRRightBoneIdx);
                             float shoulderModelR[3];
-                            if (camModelValid && headModelPos) {
+                            if (wheelOffR) {
+                                // WHEEL GRAB: this arm belongs to the animation, and so does the
+                                // girdle it hangs from. anchorStableShoulder ROTATES the clavicle
+                                // toward our body-frame anchor -- leave it running and the arm we
+                                // deliberately stopped solving is still swung off the wheel by its
+                                // own shoulder. Read the animated joint instead, write nothing.
+                                const int ui = g_VRRightUpperArmIdx;
+                                shoulderModelR[0] = g_fkPos[ui][0];
+                                shoulderModelR[1] = g_fkPos[ui][1];
+                                shoulderModelR[2] = g_fkPos[ui][2];
+                                VRIK_BuildHandTarget(shoulderModelR, shoulderBodyR, hmdRel, vrPos, vrQuat,
+                                                     wristR, g_VRScaleR, offR, target, handRot);
+                            } else if (camModelValid && headModelPos) {
                                 // CONFIRMED-WORKING path (2026-06-05: "head-coupling GONE, tracking +
                                 // weapon great"). hmdRel (HMD orientation rel the recenter base) cancels
                                 // head rotation MATHEMATICALLY, so there is NO inversion when you turn --
@@ -3247,11 +3734,23 @@ extern "C" inline void* Hooked_AnimPoseApply(void* a1, void* a2, void* a3, unsig
                                 if (hn < 2) ++hn;
                             }
                             rhWristValid = true;
-                            VRIK_SolveArm(boneBuf, g_VRRightUpperArmIdx, g_VRRightForeArmIdx,
-                                          g_VRRightBoneIdx, target, handRot,
-                                          bodyRight, bodyUp, bodyFwd,
-                                          g_VRElbowPoleR * 0.01745329252f, g_VRElbowSwingR,
-                                          /*isLeft*/false, /*storeDbg*/true);
+                            // WHEEL GRAB. Store the controller target FIRST: it is what the next
+                            // solve measures against the animated hand, and it has to keep being
+                            // recorded while the arm is handed over, or letting go of the wheel
+                            // could never re-arm.
+                            VRIK_WheelStoreTarget(0, target);
+                            // Blend unconditionally (a no-op at 0, exact at 1) so everything
+                            // downstream that treats (target, handRot) as the hand's model
+                            // transform -- the cigarette mouth anchor below -- follows the hand
+                            // that is actually rendered, not the controller it left behind.
+                            VRIK_WheelBlendTarget(0, target, handRot);
+                            if (!wheelOffR) {
+                                VRIK_SolveArm(boneBuf, g_VRRightUpperArmIdx, g_VRRightForeArmIdx,
+                                              g_VRRightBoneIdx, target, handRot,
+                                              bodyRight, bodyUp, bodyFwd,
+                                              g_VRElbowPoleR * 0.01745329252f, g_VRElbowSwingR,
+                                              /*isLeft*/false, /*storeDbg*/true);
+                            }
                             // SMOKING: head<->cig-hand distance. vrPos is the right controller expressed
                             // RELATIVE TO THE HMD (HMD-local, metres) -- the same input the arm solve
                             // maps into model space. Its magnitude is literally how far the cig hand
@@ -3366,7 +3865,15 @@ extern "C" inline void* Hooked_AnimPoseApply(void* a1, void* a2, void* a3, unsig
                             const float shoulderBodyL[3]= { g_VRShoulderLX, g_VRShoulderLY, g_VRShoulderLZ };
                             float armLenL = restArmLen(g_VRLeftUpperArmIdx, g_VRLeftForeArmIdx, g_VRLeftBoneIdx);
                             float shoulderModelL[3];
-                            if (camModelValid && headModelPos) {
+                            if (wheelOffL) {
+                                // WHEEL GRAB -- animated girdle, no clavicle write (see right arm).
+                                const int ui = g_VRLeftUpperArmIdx;
+                                shoulderModelL[0] = g_fkPos[ui][0];
+                                shoulderModelL[1] = g_fkPos[ui][1];
+                                shoulderModelL[2] = g_fkPos[ui][2];
+                                VRIK_BuildHandTarget(shoulderModelL, shoulderBodyL, hmdRel, vrPos, vrQuat,
+                                                     wristL, g_VRScaleL, offL, target, handRot);
+                            } else if (camModelValid && headModelPos) {
                                 anchorStableShoulder(g_VRLeftUpperArmIdx, stableAnchor, /*isLeft*/true, shoulderModelL);
                                 VRIK_BuildHandTarget(shoulderModelL, shoulderBodyL, hmdRel, vrPos, vrQuat,
                                                      wristL, g_VRScaleL, offL, target, handRot);
@@ -3480,12 +3987,20 @@ extern "C" inline void* Hooked_AnimPoseApply(void* a1, void* a2, void* a3, unsig
                                     VRIK_QuatMul(hm, wristL, handRot); VRIK_QuatNorm(handRot);
                                 }
                             }
-                            VRIK_SolveArm(boneBuf, g_VRLeftUpperArmIdx, g_VRLeftForeArmIdx,
-                                          g_VRLeftBoneIdx, target, handRot,
-                                          bodyRight, bodyUp, bodyFwd,
-                                          g_VRElbowPoleL * 0.01745329252f, g_VRElbowSwingL,
-                                          /*isLeft*/true, /*storeDbg*/true);
+                            VRIK_WheelStoreTarget(1, target);
+                            VRIK_WheelBlendTarget(1, target, handRot);
+                            if (!wheelOffL) {
+                                VRIK_SolveArm(boneBuf, g_VRLeftUpperArmIdx, g_VRLeftForeArmIdx,
+                                              g_VRLeftBoneIdx, target, handRot,
+                                              bodyRight, bodyUp, bodyFwd,
+                                              g_VRElbowPoleL * 0.01745329252f, g_VRElbowSwingL,
+                                              /*isLeft*/true, /*storeDbg*/true);
+                            }
                         }
+                        // STEERING. Here and not in VRIK_WheelUpdate: this is the first point
+                        // where BOTH controller targets are this solve's, and where the body
+                        // right/up axes that define the wheel's plane are in scope.
+                        VRIK_WheelSteerUpdate(bodyRight, bodyUp);
                         // HAND-TO-HOLSTER distances [20..22] -- computed AFTER the arm solve,
                         // from the SOLVED right wrist (rhWristModel = the arm-IK target = the
                         // player's controller in model space). The old pre-solve version read
@@ -3625,13 +4140,23 @@ extern "C" inline void* Hooked_AnimPoseApply(void* a1, void* a2, void* a3, unsig
                             cachePush(g_VRRightUpLegIdx); cachePush(g_VRRightLegIdx); cachePush(g_VRRightFootIdx);
                             cachePush(g_VRLeftUpLegIdx);  cachePush(g_VRLeftLegIdx);  cachePush(g_VRLeftFootIdx);
                         }
-                        cachePush(g_VRRightUpperArmIdx >= 0 && g_VRRightUpperArmIdx < VRIK_MAX_BONES
-                                  ? g_VRBoneParent[g_VRRightUpperArmIdx] : -1);
-                        cachePush(g_VRLeftUpperArmIdx >= 0 && g_VRLeftUpperArmIdx < VRIK_MAX_BONES
-                                  ? g_VRBoneParent[g_VRLeftUpperArmIdx] : -1);
-                        cachePush(g_VRRightUpperArmIdx); cachePush(g_VRRightForeArmIdx); cachePush(g_VRRightBoneIdx);
-                        cachePush(g_VRLeftUpperArmIdx);  cachePush(g_VRLeftForeArmIdx);  cachePush(g_VRLeftBoneIdx);
-                        for (int k = 0; k < 3; ++k) { cachePush(g_VRForeTwistR[k]); cachePush(g_VRForeTwistL[k]); }
+                        // WHEEL GRAB: an arm we did not write is not ours to replay. Caching it
+                        // would freeze the engine's own per-pass arm pose inside the tick -- the
+                        // same reason the body bones are left out in a vehicle -- and, worse,
+                        // would keep re-applying the last solved locals over the animation, so
+                        // the hand would never actually reach the wheel.
+                        if (!wheelOffR) {
+                            cachePush(g_VRRightUpperArmIdx >= 0 && g_VRRightUpperArmIdx < VRIK_MAX_BONES
+                                      ? g_VRBoneParent[g_VRRightUpperArmIdx] : -1);
+                            cachePush(g_VRRightUpperArmIdx); cachePush(g_VRRightForeArmIdx); cachePush(g_VRRightBoneIdx);
+                            for (int k = 0; k < 3; ++k) cachePush(g_VRForeTwistR[k]);
+                        }
+                        if (!wheelOffL) {
+                            cachePush(g_VRLeftUpperArmIdx >= 0 && g_VRLeftUpperArmIdx < VRIK_MAX_BONES
+                                      ? g_VRBoneParent[g_VRLeftUpperArmIdx] : -1);
+                            cachePush(g_VRLeftUpperArmIdx);  cachePush(g_VRLeftForeArmIdx);  cachePush(g_VRLeftBoneIdx);
+                            for (int k = 0; k < 3; ++k) cachePush(g_VRForeTwistL[k]);
+                        }
                         g_solveCacheTick = tickNow;
                     }
                     }

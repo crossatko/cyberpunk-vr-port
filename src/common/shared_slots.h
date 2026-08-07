@@ -115,6 +115,32 @@
 //  [154]       left trigger analog (0..1)     plugin -> Smoking CET bridge
 //  [155]       left grip pressed (0/1)        plugin -> Smoking CET bridge
 //  [156]       DEBUG logging on (0/1)         plugin -> every CET bridge
+//
+// ---------------------------------------------------------------------------
+// WHEEL GRAB (hands to the steering wheel / handlebars). Per hand, independent.
+// ---------------------------------------------------------------------------
+//  [157]      wheel-grab blend, RIGHT hand (0 = arm IK, 1 = pure animation)
+//                                            hands plugin -> dxgi, overlay
+//  [158]      wheel-grab blend, LEFT hand    hands plugin -> dxgi, overlay
+//  [159]      wheel-grab ARMED mask: bit0 (1) = right hand is at its animated
+//             hand pose, bit1 (2) = left. Raised BEFORE the grip is pressed, so
+//             the input side can take the grip out of its normal gameplay
+//             meaning without leaking one frame of it on the press.
+//                                            hands plugin -> dxgi, Holster Lua
+//  [160]      wheel-grab enabled (0/1)       dxgi (overlay/ini) -> hands plugin
+//  [161]      wheel-grab proximity radius, metres  dxgi -> hands plugin
+//  [162]      player is DRIVING (in the driver seat, not a passenger). [31] stays
+//             "mounted to anything" -- the VRIK body chain is dropped for both.
+//                                            dxgi -> hands plugin
+//  [163]      STEERING, as a left-stick X value (-1 full left .. +1 full right),
+//             already faded by the grab blend. The angle comes from the line
+//             through the two CONTROLLERS (one hand: controller vs the wheel
+//             centre), measured in the body's right/up plane.
+//                                            hands plugin -> dxgi (XInput merge)
+//  [164]      steering angle, degrees (diagnostic / overlay read-out)
+//                                            hands plugin -> overlay
+//  [165]      steering angle that means full lock, degrees (default 90)
+//                                            dxgi -> hands plugin
 // ============================================================================
 
 namespace vrshared {
@@ -149,4 +175,17 @@ constexpr int kLeftGripPressed   = 155;
 // smoking one alone in a single session, and as much again from the weapon one. A log nobody can
 // open is a log nobody reads.
 constexpr int kDebugLog          = 156;
+// Wheel grab. Named from the start -- the whole point of the numbered graveyard above is that
+// picking a slot off a comment is how the lighter ended up riding a millisecond timestamp.
+constexpr int kWheelBlendRight   = 157;
+constexpr int kWheelBlendLeft    = 158;
+constexpr int kWheelArmedMask    = 159;
+constexpr int kWheelArmedRightBit = 1;
+constexpr int kWheelArmedLeftBit  = 2;
+constexpr int kWheelEnable       = 160;
+constexpr int kWheelRadius       = 161;
+constexpr int kIsDriving         = 162;
+constexpr int kWheelSteer        = 163;
+constexpr int kWheelSteerDeg     = 164;
+constexpr int kWheelSteerMaxDeg  = 165;
 } // namespace vrshared

@@ -117,6 +117,9 @@ struct LiveControls {
     volatile int xrSnapTurnYawIndex; // which float index in deltaHead[] gets the snap yaw. Default 1.
     volatile int xrImmersiveHolsters; // 1 = visual-holster equip (default), 0 = simple slot mapping (back=Slot1, R hip=Slot2, L hip=Slot3). Published to shared[23] for the CET Holster mod.
     volatile int xrPhysicalBodyRotation; // 1 = physical body rotation (avatar body follows HMD/aim heading). 0 (default) = classic stick/snap heading. Gates the aiming/weapon body-turn paths; vehicles unaffected.
+    volatile int xrWheelGrab;       // 1 (default) = hand-to-wheel grab while driving: a grip squeezed with the hand on the animated wheel pose hands that arm back to the driving animation. Per hand. Published to shared[160].
+    volatile float xrWheelRadius;   // how near the animated hand the controller must be for the grip to mean "grab", metres. Default 0.28. Published to shared[161].
+    volatile float xrWheelSteerMaxDeg; // controller tilt that means full lock, degrees. 90 (default) = hands vertical. Lower turns less wrist into more steering. Published to shared[165].
 };
 
 static constexpr int kEnablePatchBufferTracer = 0;
@@ -171,6 +174,14 @@ void InitRuntimePaths() {
 
     // Default: immersive holsters ON (current behaviour -- equip by visual holster).
     g_liveControls.xrImmersiveHolsters = 1;
+
+    // Default: wheel grab ON. 0.28 m is a hand-sized reach around the animated wheel pose --
+    // wide enough that you do not have to hunt for the wheel with a hand you cannot see, tight
+    // enough that a hand resting on your knee never arms it.
+    g_liveControls.xrWheelGrab = 1;
+    g_liveControls.xrWheelRadius = 0.28f;
+    // 90 deg = hands vertical is full lock, the 1:1 reading of a real wheel.
+    g_liveControls.xrWheelSteerMaxDeg = 90.0f;
 
     // Default ON: VR controller -> XInput gamepad pipeline. Both the entry-point
     // detour (xrXInputInstall) and the gameplay action set (xrInputActions) are
@@ -477,6 +488,9 @@ static void PollLiveControls() {
     int xrSnapTurnYawIndex = g_liveControls.xrSnapTurnYawIndex >= 0 && g_liveControls.xrSnapTurnYawIndex <= 3 ? g_liveControls.xrSnapTurnYawIndex : 1;
     int xrImmersiveHolsters = g_liveControls.xrImmersiveHolsters;
     int xrPhysicalBodyRotation = g_liveControls.xrPhysicalBodyRotation;
+    int xrWheelGrab = g_liveControls.xrWheelGrab;
+    float xrWheelRadius = g_liveControls.xrWheelRadius > 0.0f ? g_liveControls.xrWheelRadius : 0.28f;
+    float xrWheelSteerMaxDeg = g_liveControls.xrWheelSteerMaxDeg > 0.0f ? g_liveControls.xrWheelSteerMaxDeg : 90.0f;
 
     FILE* file = _fsopen(g_liveControlPath, "r", _SH_DENYNO);
     if (!file) return;
@@ -709,6 +723,21 @@ static void PollLiveControls() {
             xrImmersiveHolsters = intValue;
             continue;
         }
+        if (sscanf_s(line, "xr_wheel_grab=%d", &intValue) == 1 ||
+            sscanf_s(line, "xr_wheel_grab = %d", &intValue) == 1) {
+            xrWheelGrab = intValue;
+            continue;
+        }
+        if (sscanf_s(line, "xr_wheel_radius=%f", &value) == 1 ||
+            sscanf_s(line, "xr_wheel_radius = %f", &value) == 1) {
+            xrWheelRadius = value;
+            continue;
+        }
+        if (sscanf_s(line, "xr_wheel_steer_max_deg=%f", &value) == 1 ||
+            sscanf_s(line, "xr_wheel_steer_max_deg = %f", &value) == 1) {
+            xrWheelSteerMaxDeg = value;
+            continue;
+        }
 
     }
     fclose(file);
@@ -780,6 +809,13 @@ static void PollLiveControls() {
     g_liveControls.xrSnapTurnYawIndex = (xrSnapTurnYawIndex >= 0 && xrSnapTurnYawIndex <= 3) ? xrSnapTurnYawIndex : 1;
     g_liveControls.xrImmersiveHolsters = xrImmersiveHolsters != 0 ? 1 : 0;
     OpenXRManager::Get().SetImmersiveHolsters(g_liveControls.xrImmersiveHolsters);
+    g_liveControls.xrWheelGrab = xrWheelGrab != 0 ? 1 : 0;
+    // Clamped, not trusted: the radius comes from a text file. Below ~8 cm the grab is
+    // unreachable for a hand you cannot see; above 60 cm every grip in a car is a grab.
+    g_liveControls.xrWheelRadius = (xrWheelRadius < 0.08f) ? 0.08f
+                                 : (xrWheelRadius > 0.60f ? 0.60f : xrWheelRadius);
+    g_liveControls.xrWheelSteerMaxDeg = (xrWheelSteerMaxDeg < 30.0f) ? 30.0f
+                                      : (xrWheelSteerMaxDeg > 120.0f ? 120.0f : xrWheelSteerMaxDeg);
     SetHmdTrackingSmooth(xrHmdSmooth);
     SetHandTrackingSmooth(xrHandSmooth);
     WriteVrikSettingsFile(); // keep the CET-facing bridge file in sync with vrport.ini
@@ -840,6 +876,9 @@ static LiveControlsUiState MakeLiveControlsUiState() {
     state.xrMonoDepthCapture = g_liveControls.xrMonoDepthCapture;
     state.xrSnapTurnPulseMs = g_liveControls.xrSnapTurnPulseMs;
     state.xrImmersiveHolsters = g_liveControls.xrImmersiveHolsters;
+    state.xrWheelGrab = g_liveControls.xrWheelGrab;
+    state.xrWheelRadius = g_liveControls.xrWheelRadius;
+    state.xrWheelSteerMaxDeg = g_liveControls.xrWheelSteerMaxDeg;
     // HUD placement isn't stored in g_liveControls; pull the last overlay-set
     // values (loaded from hud_layout.ini) into the contiguous xrHud* block.
     EnsureHudLoaded();
@@ -892,6 +931,9 @@ static void PersistLiveControlsUiState(const LiveControlsUiState& state) {
     fprintf(file, "xr_mono_depth_capture=%d\n", state.xrMonoDepthCapture != 0 ? 1 : 0);
     fprintf(file, "xr_snap_turn_pulse_ms=%d\n", state.xrSnapTurnPulseMs > 0 ? state.xrSnapTurnPulseMs : 30);
     fprintf(file, "xr_immersive_holsters=%d\n", state.xrImmersiveHolsters != 0 ? 1 : 0);
+    fprintf(file, "xr_wheel_grab=%d\n", state.xrWheelGrab != 0 ? 1 : 0);
+    fprintf(file, "xr_wheel_radius=%.3f\n", state.xrWheelRadius > 0.0f ? state.xrWheelRadius : 0.28f);
+    fprintf(file, "xr_wheel_steer_max_deg=%.1f\n", state.xrWheelSteerMaxDeg > 0.0f ? state.xrWheelSteerMaxDeg : 90.0f);
     fclose(file);
 
     WIN32_FILE_ATTRIBUTE_DATA fileData;
@@ -956,6 +998,13 @@ extern "C" void SetLiveControlsUiState(const LiveControlsUiState* state, int per
     g_liveControls.xrSnapTurnPulseMs = state->xrSnapTurnPulseMs > 0 ? state->xrSnapTurnPulseMs : 30;
     g_liveControls.xrImmersiveHolsters = state->xrImmersiveHolsters != 0 ? 1 : 0;
     OpenXRManager::Get().SetImmersiveHolsters(g_liveControls.xrImmersiveHolsters);
+    g_liveControls.xrWheelGrab = state->xrWheelGrab != 0 ? 1 : 0;
+    {
+        const float r = state->xrWheelRadius;
+        g_liveControls.xrWheelRadius = (r < 0.08f) ? 0.08f : (r > 0.60f ? 0.60f : r);
+        const float m = state->xrWheelSteerMaxDeg;
+        g_liveControls.xrWheelSteerMaxDeg = (m < 30.0f) ? 30.0f : (m > 120.0f ? 120.0f : m);
+    }
     WriteVrikSettingsFile(); // publish mouse-Y flag for the CET VRIK mod
 
     if (prevMono != g_liveControls.xrMonoSubmit) {
@@ -2696,6 +2745,12 @@ static float* GetShotShared() {
 static RED4ext::CProperty* g_mountedVehicleProp = nullptr;
 static RED4ext::CProperty* g_isAimingProp = nullptr;
 static RED4ext::CProperty* g_equippedWeaponProp = nullptr;
+// VehicleComponent::IsDriver(GameInstance, GameObject) -- a STATIC script function, so it is
+// executed with a null instance. Used only to tell the driver seat from a passenger one: the
+// wheel grab has nothing to hold on to in the back of a taxi. If the function cannot be
+// resolved we fall back to "mounted to anything", which is what [31] already means -- the
+// feature degrades to slightly too permissive rather than to dead.
+static RED4ext::CBaseFunction* g_isDriverFunc = nullptr;
 static bool g_isRTTIInitialized = false;
 
 
@@ -2729,12 +2784,23 @@ void InitializeMountedVehicleCache() {
 
     }
 
+    // The class is registered lower-case ("vehicleComponent") in some builds and capitalised in
+    // others; ask for both rather than guess.
+    for (const char* cls : { "VehicleComponent", "vehicleComponent" }) {
+        if (g_isDriverFunc) break;
+        if (auto c = rtti->GetClass(cls)) g_isDriverFunc = c->GetFunction("IsDriver");
+    }
+    Log("[VR] VehicleComponent::IsDriver %s -- wheel grab is %s\n",
+        g_isDriverFunc ? "resolved" : "NOT FOUND",
+        g_isDriverFunc ? "driver-seat only" : "allowed in any seat (fallback)");
+
     g_isRTTIInitialized = true;
 }
 
 
 static uint64_t g_locateCameraHits = 0;
 bool g_isInVehicle = false;
+bool g_isDriving = false;      // in a vehicle AND in the driver seat (wheel-grab gate)
 bool g_isAiming = false;
 bool g_hasWeaponEquipped = false;
 // [dx-win]/[jerk] diag: ENGINE located camera captured at callback entry (pre-overwrite).
@@ -2818,6 +2884,26 @@ extern "C" void __fastcall OnLocateCameraCallback(float* rbxPtr, float xmm0_val)
                 g_isInVehicle = (mountedVehicle.instance != nullptr);
             }
 
+            // DRIVER SEAT, not just mounted. Only the driver has a wheel (or handlebars) in
+            // front of them, and the wheel grab hands the arms back to the driving animation --
+            // which is the wrong pose for every other seat. Static call, null instance.
+            g_isDriving = false;
+            if (g_isInVehicle) {
+                if (g_isDriverFunc && playerHandle) {
+                    RED4ext::ScriptGameInstance gi;
+                    bool isDriver = false;
+                    RED4ext::StackArgs_t args;
+                    args.emplace_back(nullptr, &gi);
+                    args.emplace_back(nullptr, &playerHandle);
+                    // The cast picks the (void* instance) overload: a bare nullptr is ambiguous
+                    // against the (CClass* context) one, and a static function wants no instance.
+                    if (RED4ext::ExecuteFunction(static_cast<void*>(nullptr), g_isDriverFunc, &isDriver, args))
+                        g_isDriving = isDriver;
+                } else {
+                    g_isDriving = true;   // no IsDriver -> any seat, see InitializeMountedVehicleCache
+                }
+            }
+
             if (playerHandle && g_isAimingProp) {
                 g_isAiming = g_isAimingProp->GetValue<bool>(playerHandle.instance);
             }
@@ -2837,6 +2923,13 @@ extern "C" void __fastcall OnLocateCameraCallback(float* rbxPtr, float xmm0_val)
             // the vehicle drives the puppet, body IK fights it and breaks the
             // character/camera position. Arms-only in vehicles.
             OpenXRManager::Get().SetSharedSlot(31, g_isInVehicle ? 1.0f : 0.0f);
+            // Wheel grab: the driver-seat gate plus the two settings the hands plugin solves
+            // with. Published on the same gameplay-rate refresh -- none of it changes per frame.
+            OpenXRManager::Get().SetSharedSlot(vrshared::kIsDriving, g_isDriving ? 1.0f : 0.0f);
+            OpenXRManager::Get().SetSharedSlot(vrshared::kWheelEnable,
+                                               g_liveControls.xrWheelGrab != 0 ? 1.0f : 0.0f);
+            OpenXRManager::Get().SetSharedSlot(vrshared::kWheelRadius, g_liveControls.xrWheelRadius);
+            OpenXRManager::Get().SetSharedSlot(vrshared::kWheelSteerMaxDeg, g_liveControls.xrWheelSteerMaxDeg);
         }
     }
     
@@ -6665,8 +6758,21 @@ static DWORD WINAPI HookedXInputGetState(DWORD dwUserIndex, XINPUT_STATE* pState
         r = ERROR_SUCCESS;
     }
 
+    // WHEEL GRAB takes the grip out of its gameplay meaning while a hand is at the wheel.
+    // The left grip is merged as LB (openxr_frameloop.cpp), which in a car is a vehicle
+    // action -- so reaching for the wheel and squeezing would fire it on the way in. The
+    // mask is raised on PROXIMITY, before any grip is pressed, precisely so there is no
+    // one-frame leak on the press. The grip VALUES ([49]/[155]) keep being published:
+    // the hands plugin needs them to detect the grab itself.
+    uint16_t vrButtons = vr.buttons;
+    {
+        int armed = 0;
+        if (float* sh = GetShotShared()) armed = static_cast<int>(sh[vrshared::kWheelArmedMask]);
+        if (armed & vrshared::kWheelArmedLeftBit) vrButtons &= static_cast<uint16_t>(~0x0100); // LB
+    }
+
     // Buttons: OR (so a physical pad can still augment, and vice versa).
-    pState->Gamepad.wButtons |= vr.buttons;
+    pState->Gamepad.wButtons |= vrButtons;
 
     // MENU-ONLY: right grip = RB (right shoulder) for tab navigation to the RIGHT,
     // symmetric with the left grip's LB. The right grip is deliberately NEVER merged as
@@ -6745,6 +6851,24 @@ static DWORD WINAPI HookedXInputGetState(DWORD dwUserIndex, XINPUT_STATE* pState
     float ly = ApplyStickDeadzone(vr.leftThumbY, 0.12f);
     if (fabsf(lx) > fabsf(pState->Gamepad.sThumbLX / 32767.0f)) pState->Gamepad.sThumbLX = FloatToSHORT(lx);
     if (fabsf(ly) > fabsf(pState->Gamepad.sThumbLY / 32767.0f)) pState->Gamepad.sThumbLY = FloatToSHORT(ly);
+
+    // WHEEL STEERING. While a hand is holding the wheel, the tilt of the line through the
+    // controllers IS the left stick X -- the hands plugin has already turned it into a stick
+    // value and faded it by the grab blend, so releasing the wheel hands the steering back over
+    // the same tenth of a second the arm takes to return. Assignment, not max(): the whole point
+    // is that the wheel drives the car, and a thumb still resting on the stick must not fight it.
+    // Y is left alone (throttle and brake are the triggers).
+    {
+        auto& xrIn = OpenXRManager::Get();
+        const float bR = xrIn.GetSharedSlot(vrshared::kWheelBlendRight);
+        const float bL = xrIn.GetSharedSlot(vrshared::kWheelBlendLeft);
+        if (bR > 0.01f || bL > 0.01f) {
+            float steer = xrIn.GetSharedSlot(vrshared::kWheelSteer);
+            if (steer >  1.0f) steer =  1.0f;
+            if (steer < -1.0f) steer = -1.0f;
+            pState->Gamepad.sThumbLX = FloatToSHORT(steer);
+        }
+    }
 
     // Left stick pushed near FULL forward => SPRINT. A partial push is left as the
     // game's normal jog; only "to the stop" sprints. CP2077 sprint is the left-stick

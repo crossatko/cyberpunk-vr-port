@@ -2712,6 +2712,10 @@ void UpdateVRIKAnimInputs(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* 
             if (s_lastReq > 0) {
                 g_VRBind = 0; g_VRDiagCapture = 0;                    // on -> off edge
                 g_pSharedHands[119] = 0.0f;  // eye-view offset invalid while VRIK is off
+                // The wheel grab lives inside the mode-4 solve; with tracking off nothing
+                // would ever lower its armed mask again, and the left grip would stay out
+                // of the gamepad for the rest of the session.
+                VRIK_WheelReset();
             }
             s_vrArmed = false;                     // re-arm on next activation
             s_staleFrames = 0;

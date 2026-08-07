@@ -1,6 +1,7 @@
 #include "imgui_overlay.h"
 #include "live_controls_ui.h"
 #include "openxr_manager.h"
+#include "shared_slots.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -1482,6 +1483,59 @@ bool DrawLiveControls(LiveControlsUiState& state) {
                     "OFF - ignore visual holsters, fixed slot per zone:\n"
                     "      over-shoulder = EquipmentSlot1, right hip = Slot2, left hip = Slot3.\n"
                     "Reach to the zone and squeeze the RIGHT grip to equip / unequip.");
+            }
+
+            ImGui::Separator();
+            ImGui::TextUnformatted("Driving -- hands on the wheel");
+            changed |= CheckboxInt("Grab the wheel with the grips", &state.xrWheelGrab);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "While DRIVING, bring a hand to where the driving animation holds the\n"
+                    "wheel (or the handlebars) and squeeze that grip: the arm is handed back\n"
+                    "to the game's own animation -- hand on the wheel, fingers wrapped around\n"
+                    "it -- instead of following the controller. Release the grip and it goes\n"
+                    "back to your hand.\n\n"
+                    "Each hand is independent: hold the wheel with one and keep the other on\n"
+                    "a gun. While a hand is at the wheel that grip does nothing else (no\n"
+                    "holster equip, no LB).");
+            }
+            {
+                float r = state.xrWheelRadius > 0.0f ? state.xrWheelRadius : 0.28f;
+                if (ImGui::SliderFloat("Grab radius (m)", &r, 0.08f, 0.60f, "%.2f")) {
+                    state.xrWheelRadius = r;
+                    changed = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("How close your hand has to be to the animated hand before the\n"
+                                      "grip counts as grabbing the wheel. Bigger = easier to catch a\n"
+                                      "wheel you cannot see; too big and every grip in a car grabs.");
+                }
+                float m = state.xrWheelSteerMaxDeg > 0.0f ? state.xrWheelSteerMaxDeg : 90.0f;
+                if (ImGui::SliderFloat("Full lock at (deg)", &m, 30.0f, 120.0f, "%.0f")) {
+                    state.xrWheelSteerMaxDeg = m;
+                    changed = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Tilt of the line through your controllers that steers fully.\n"
+                                      "90 = hands vertical is full lock (a real wheel, 1:1).\n"
+                                      "Lower = the same wrist movement steers more.");
+                }
+                // Live state, so "it did not grab" and "it steers the wrong way" are both
+                // answerable without a log: the mask is raised by proximity, the blends by the
+                // grab itself, and the angle is what the stick is being driven from.
+                {
+                    auto& xr = OpenXRManager::Get();
+                    const int mask = static_cast<int>(xr.GetSharedSlot(vrshared::kWheelArmedMask));
+                    ImGui::Text("driving %d   at wheel  L %d R %d   hold  L %.2f R %.2f",
+                                xr.GetSharedSlot(vrshared::kIsDriving) > 0.5f ? 1 : 0,
+                                (mask & vrshared::kWheelArmedLeftBit) ? 1 : 0,
+                                (mask & vrshared::kWheelArmedRightBit) ? 1 : 0,
+                                xr.GetSharedSlot(vrshared::kWheelBlendLeft),
+                                xr.GetSharedSlot(vrshared::kWheelBlendRight));
+                    ImGui::Text("steer  %+.1f deg  ->  stick %+.2f",
+                                xr.GetSharedSlot(vrshared::kWheelSteerDeg),
+                                xr.GetSharedSlot(vrshared::kWheelSteer));
+                }
             }
 
             ImGui::Separator();
