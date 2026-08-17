@@ -1510,15 +1510,46 @@ bool DrawLiveControls(LiveControlsUiState& state) {
                                       "grip counts as grabbing the wheel. Bigger = easier to catch a\n"
                                       "wheel you cannot see; too big and every grip in a car grabs.");
                 }
+                float d = state.xrWheelSteerDeadDeg >= 0.0f ? state.xrWheelSteerDeadDeg : 1.5f;
+                if (ImGui::SliderFloat("Steering deadzone (deg)", &d, 0.0f, 20.0f, "%.1f")) {
+                    state.xrWheelSteerDeadDeg = d;
+                    changed = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Tilt around centre that steers nothing at all.\n"
+                                      "Raise it if the car drifts while you hold the wheel straight;\n"
+                                      "every degree here is a degree of dead wheel off centre.\n"
+                                      "The full range still ends at 'Full lock at', so widening the\n"
+                                      "deadzone does not make the steering jump.");
+                }
                 float m = state.xrWheelSteerMaxDeg > 0.0f ? state.xrWheelSteerMaxDeg : 90.0f;
                 if (ImGui::SliderFloat("Full lock at (deg)", &m, 30.0f, 120.0f, "%.0f")) {
                     state.xrWheelSteerMaxDeg = m;
                     changed = true;
                 }
                 if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Tilt of the line through your controllers that steers fully.\n"
+                    ImGui::SetTooltip("Wheel sensitivity: the controller tilt that means full stick.\n"
+                                      "Two hands = tilt of the line through the controllers, one hand\n"
+                                      "= tilt of that controller against the wheel centre.\n"
                                       "90 = hands vertical is full lock (a real wheel, 1:1).\n"
                                       "Lower = the same wrist movement steers more.");
+                }
+                changed |= CheckboxInt("Horn -- hand on the wheel hub", &state.xrWheelHorn);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "While DRIVING, put a hand on the MIDDLE of the wheel -- where you would\n"
+                        "slap a real horn -- and the car honks for as long as it stays there.\n"
+                        "No grip needed; a hand that is GRABBING the wheel never honks.");
+                }
+                float hr = state.xrWheelHornRadius > 0.0f ? state.xrWheelHornRadius : 0.12f;
+                if (ImGui::SliderFloat("Horn hub radius (m)", &hr, 0.04f, 0.30f, "%.2f")) {
+                    state.xrWheelHornRadius = hr;
+                    changed = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("How near the wheel centre the hand counts as on the hub.\n"
+                                      "Bigger = easier to find the horn without seeing it; too big\n"
+                                      "and it reaches the rim, so every grab honks.");
                 }
                 // Live state, so "it did not grab" and "it steers the wrong way" are both
                 // answerable without a log: the mask is raised by proximity, the blends by the
@@ -1535,6 +1566,36 @@ bool DrawLiveControls(LiveControlsUiState& state) {
                     ImGui::Text("steer  %+.1f deg  ->  stick %+.2f",
                                 xr.GetSharedSlot(vrshared::kWheelSteerDeg),
                                 xr.GetSharedSlot(vrshared::kWheelSteer));
+                    const int horn = static_cast<int>(xr.GetSharedSlot(vrshared::kWheelHornMask));
+                    ImGui::Text("horn   L %d R %d",
+                                (horn & vrshared::kWheelArmedLeftBit) ? 1 : 0,
+                                (horn & vrshared::kWheelArmedRightBit) ? 1 : 0);
+                }
+
+                ImGui::Spacing();
+                changed |= CheckboxInt("Trigger fires the gun while driving", &state.xrVehicleGunTrigger);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "Draw a weapon in the driver seat and the RIGHT TRIGGER stops being the\n"
+                        "throttle and becomes the gun: drive with the left hand on the wheel and\n"
+                        "shoot with the right.\n\n"
+                        "The throttle LATCHES at whatever it was when the weapon came out, so the\n"
+                        "car keeps rolling, and the LEFT STICK forward/back trims that speed while\n"
+                        "you shoot. Holster the weapon and the trigger is the throttle again.\n\n"
+                        "While the weapon is out the left stick's forward/back is taken by the\n"
+                        "trim: no lean / rock and no autodrive gesture until you holster.");
+                }
+                {
+                    float tt = state.xrVehicleThrottleTrim > 0.0f ? state.xrVehicleThrottleTrim : 0.5f;
+                    if (ImGui::SliderFloat("Throttle trim rate (/s)", &tt, 0.05f, 3.0f, "%.2f")) {
+                        state.xrVehicleThrottleTrim = tt;
+                        changed = true;
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("How much of the throttle's full travel the left stick adds or\n"
+                                          "removes per second while a weapon is out.\n"
+                                          "0.5 = two seconds held to go from idle to floored.");
+                    }
                 }
             }
 

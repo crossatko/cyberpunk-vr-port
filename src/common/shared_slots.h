@@ -141,6 +141,17 @@
 //                                            hands plugin -> overlay
 //  [165]      steering angle that means full lock, degrees (default 90)
 //                                            dxgi -> hands plugin
+//  [166]      steering DEADZONE around centre, degrees (default 1.5). Tilt below
+//             this steers nothing; the useful range starts where it ends, so the
+//             output does not jump when a wide deadzone is dialled in.
+//                                            dxgi -> hands plugin
+//  [167]      HORN at the hub enabled (0/1)  dxgi -> hands plugin
+//  [168]      horn hub radius, metres (default 0.12)
+//                                            dxgi -> hands plugin
+//  [169]      HORN mask: a hand is on the wheel HUB. Same bits as [159]
+//             (bit0 = right, bit1 = left). The input side holds the vehicle's
+//             horn button while it is non-zero.
+//                                            hands plugin -> dxgi (XInput merge)
 // ============================================================================
 
 namespace vrshared {
@@ -188,4 +199,9 @@ constexpr int kIsDriving         = 162;
 constexpr int kWheelSteer        = 163;
 constexpr int kWheelSteerDeg     = 164;
 constexpr int kWheelSteerMaxDeg  = 165;
+constexpr int kWheelSteerDeadDeg = 166;
+constexpr int kWheelHornEnable   = 167;
+constexpr int kWheelHornRadius   = 168;
+// Reuses kWheelArmedRightBit / kWheelArmedLeftBit -- same "which hand" convention as [159].
+constexpr int kWheelHornMask     = 169;
 } // namespace vrshared

@@ -120,6 +120,19 @@ struct LiveControlsUiState {
     // Controller tilt that means full lock, degrees. 90 (default) = hands vertical, the 1:1
     // reading of a real wheel; lower = the same wrist movement steers more.
     float xrWheelSteerMaxDeg;
+    // Steering deadzone around centre, degrees. 1.5 (default) only swallows tremor; raise it if
+    // holding the wheel still still drifts the car. Every degree here is a degree of dead wheel.
+    float xrWheelSteerDeadDeg;
+    // HORN. 1 (default) = laying a hand on the middle of the wheel presses the game's horn button
+    // for as long as it stays there. xrWheelHornRadius is how near the wheel centre, in metres,
+    // counts as "on the hub".
+    int xrWheelHorn;
+    float xrWheelHornRadius;
+    // DRIVING WITH A GUN. 1 (default) = with a weapon equipped in the driver seat the right
+    // trigger fires it (pad RB) and the throttle is latched at what it was, trimmed by the left
+    // stick's Y at xrVehicleThrottleTrim of full travel per second.
+    int xrVehicleGunTrigger;
+    float xrVehicleThrottleTrim;
 };
 
 extern "C" void GetLiveControlsUiState(LiveControlsUiState* outState);

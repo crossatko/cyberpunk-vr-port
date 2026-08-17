@@ -10,6 +10,11 @@ The next update introduces **fully immersive vehicle steering** using VR motion 
 - Physically grab the steering wheel or handlebars.
 - Steer naturally with real 1:1 hand movements.
 - No thumbstick steering required.
+- Steering **deadzone** and **sensitivity** are sliders: how much tilt is ignored around
+  centre, and the controller tilt that means full lock.
+- **Horn** — lay a hand on the middle of the wheel, like you would in a real car.
+- **Shoot while you drive** — with a weapon in your right hand the trigger becomes the
+  gun, the throttle holds the speed it had, and the left stick trims it.
 - Fully integrated with the VR interaction system for a more realistic driving experience.
 
 here demo of wip vehicle sterring 
@@ -54,6 +59,11 @@ Repository: <https://github.com/dariulone/cyberpunk-vr-port>
   blade (native damage/reaction/stamina).
 - **Hand-to-holster** equip/unequip on a grip squeeze — *immersive* (by visual
   holster) or *simple* (fixed weapon slots).
+- **VR driving** — squeeze a grip with your hand where the driving animation holds the
+  wheel and that arm is handed back to the animation; the tilt of the line through your
+  controllers is the steering, one-handed or two, with adjustable deadzone and lock
+  angle. A hand on the hub sounds the horn, and drawing a weapon turns the right
+  trigger into the gun while the throttle latches so the car keeps rolling.
 - **VR smoking** — cigarette and lighter as real props, with a captured
   finger grip, a hands-free mouth anchor and the game's own FX and audio.
 - **VR controller mapping** merged into XInput: full-forward = sprint,
@@ -136,6 +146,21 @@ VR controller input is merged into the native CP2077 gamepad, so the in-game
 | Left menu button | Pause menu |
 | Swing a melee weapon | VR motion melee (native attack along the blade) |
 
+While **driving**, the same controllers do something else:
+
+| Input | Action |
+|---|---|
+| Grip, hand at the wheel / handlebars | Grab it — that arm goes back to the driving animation |
+| Tilt of the line through both controllers | Steering (one hand: that controller against the wheel centre) |
+| Hand on the **middle of the wheel** | **Horn** — no grip needed; a hand that is grabbing never honks |
+| Right trigger / Left trigger | Throttle / Brake |
+| Right trigger **with a weapon drawn** | **Fire.** The throttle latches at the speed it had |
+| Left stick forward / back, weapon drawn | Trim the latched throttle |
+
+With a weapon equipped the right hand shoots and cannot grab the wheel; holster it and
+the wheel is its again. Reaching for a holster is how you draw in the first place, so the
+hand is already off the wheel by then.
+
 **D-pad chord.** Hold the **left stick clicked in**, then pick the direction with
 the **right stick** — up / down / left / right. While the chord is held the right
 stick is taken out of the camera, so selecting a direction cannot snap-turn you.
@@ -158,7 +183,11 @@ Five tabs, live, and saved to `vrport.ini` — nothing here needs a restart.
   size, motion prediction, reuse-last-clean-frame, pose pair-lock, and the head
   offset (X right / Y forward / Z up).
 - **Controls** — decoupled weapon aim and its laser dot, locomotion source
-  (Game / HMD / left hand / right hand), snap turn and angle, immersive holsters.
+  (Game / HMD / left hand / right hand), snap turn and angle, immersive holsters,
+  and the **driving** block: wheel grab and its grab radius, steering deadzone and
+  full-lock angle, horn on/off with its hub radius, trigger-fires-the-gun with its
+  throttle trim rate — plus a live read-out of what is grabbed, what the steering is
+  doing and whether the horn is being pressed.
 - **Stereo** — the second eye itself: which eye VRCAM is sent to, how stale its
   last frame may get before the submit falls back to mono, the HUD composite, and
   the live counters that say whether the second view is producing, being captured
@@ -176,7 +205,7 @@ play: it is for diagnosis and it costs both frame time and a very large log.
 | Component | Type | Purpose |
 |---|---|---|
 | `CyberpunkVR_Stereo.dll` | RED4ext plugin | OpenXR head tracking, the second engine view, HUD composite, sight shaders, F10 overlay, XInput merge |
-| `CyberpunkVR_Hands.dll` | RED4ext plugin | Full-body avatar / hand IK, weapon-aim orientation override, smoking poses, shared-memory bridge |
+| `CyberpunkVR_Hands.dll` | RED4ext plugin | Full-body avatar / hand IK, weapon-aim orientation override, smoking poses, wheel grab + steering + horn detection, shared-memory bridge |
 | `CyberpunkVRPort_Stereo` | CET | Enables the VRCAM component the launcher picked |
 | `CyberpunkVRPort_VRIK` | CET | Starts hand tracking, bridges calibration |
 | `CyberpunkVRPort_Weapon` | CET | Decoupled weapon aim + VR motion-melee detection |

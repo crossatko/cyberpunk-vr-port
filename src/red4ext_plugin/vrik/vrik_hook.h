@@ -1905,6 +1905,7 @@ struct VRIKWheelHand {
     float blend       = 0.0f;   // 0 = arm IK drives the hand, 1 = animation does
     bool  engaged     = false;  // grip held on a grab that started at the wheel
     bool  atWheel     = false;  // controller is within the radius of the animated hand
+    bool  atHub       = false;  // controller is on the wheel HUB -> horn
     bool  gripPrev    = false;
     bool  targetValid = false;
     float target[3]   = {};     // last solve's IK target (model space) -- the player's real hand
@@ -1928,9 +1929,13 @@ static bool  g_vrikWheelCenterValid = false;
 static float g_vrikWheelSpan = 0.0f;
 static float g_vrikWheelSteer = 0.0f;      // -1 .. +1, faded by the grab blend
 static float g_vrikWheelSteerDeg = 0.0f;   // the raw angle, for the overlay read-out
-// Hands level is neutral, but a hand resting on a wheel is never exactly level. Small on purpose:
-// this is only meant to swallow tremor, and every degree here is a degree of dead wheel.
-static constexpr float kWheelSteerDeadDeg = 1.5f;
+// Hands level is neutral, but a hand resting on a wheel is never exactly level. The deadzone is a
+// setting now (overlay slider -> shared[166]); this is the fallback for a zeroed / unwritten slot.
+// Small on purpose: it only has to swallow tremor, and every degree is a degree of dead wheel.
+static constexpr float kWheelSteerDeadDegDefault = 1.5f;
+// Capped under the smallest full-lock angle (30 deg) so there is always range left between the
+// deadzone and full lock.
+static constexpr float kWheelSteerDeadDegMax = 20.0f;
 // STICK FLOOR. The game has a deadzone of its own on the left stick, so the first fifth of our
 // output steered nothing at all -- "you have to turn your hands a long way before the car reacts".
 // Once past the tremor deadband we start ABOVE that threshold, and the curve below puts the rest
@@ -1941,6 +1946,16 @@ static constexpr float kWheelSteerCurve = 0.7f;
 // A lever shorter than this has no usable direction -- a hand right on the hub swings through
 // every angle on a centimetre of tremor.
 static constexpr float kWheelMinLever = 0.04f;
+
+// HORN. Fallback hub radius for a zeroed / unwritten slot, and the range the setting is trusted
+// in. The hub is the small pad in the middle of the wheel, not the wheel: 12 cm reaches it with
+// a hand you cannot see while still sitting well inside the ~17 cm the rim is held at.
+static constexpr float kWheelHornRadiusDefault = 0.12f;
+static constexpr float kWheelHornRadiusMin     = 0.04f;
+static constexpr float kWheelHornRadiusMax     = 0.30f;
+// Leaves at a slightly wider radius than it enters. A hand held right on the boundary would
+// otherwise chatter the horn on and off every solve -- an audible stutter, not a honk.
+static constexpr float kWheelHornHysteresis    = 0.03f;
 
 // Engage slower than release: reaching for the wheel is deliberate, letting go is a reaction.
 static constexpr float kWheelEngageSec  = 0.16f;
@@ -1983,28 +1998,44 @@ static inline void VRIK_WheelUpdate(float dtSec) {
     if (dtSec < 0.0f) dtSec = 0.0f;
     if (dtSec > 0.10f) dtSec = 0.10f;
 
+    // A DRAWN WEAPON OWNS THE RIGHT HAND. With a gun equipped the right hand shoots -- the input
+    // side has already taken its trigger off the throttle and put it on the weapon -- so that hand
+    // cannot also take hold of the wheel: no proximity, no grab, no arming (which leaves its grip
+    // as the normal gameplay button the holster system expects). Holster the weapon and the right
+    // hand gets the wheel back. The LEFT hand is never gated: driving one-handed with a gun out is
+    // the entire point of the mode.
+    const bool weaponOut = (VRIK_WheelSlot(vrshared::kWeaponFlag) > 0.5f);
+
     int armedMask = 0;
     for (int h = 0; h < 2; ++h) {
         VRIKWheelHand& w = g_vrikWheel[h];
+        const bool handBlocked = (h == 0) && weaponOut;
         // [49] is the right grip, [155] the left -- both binary, both published every XInput
         // poll by the stereo plugin, neither inside the hands seqlock.
         const bool grip = (h == 0) ? (VRIK_WheelSlot(49) > 0.5f)
                                    : (VRIK_WheelSlot(vrshared::kLeftGripPressed) > 0.5f);
         w.atWheel = false;
-        if (enabled && driving && w.animValid && w.targetValid) {
+        if (enabled && driving && !handBlocked && w.animValid && w.targetValid) {
             const float dx = w.target[0] - w.animPos[0];
             const float dy = w.target[1] - w.animPos[1];
             const float dz = w.target[2] - w.animPos[2];
             w.atWheel = (dx*dx + dy*dy + dz*dz) <= (radius * radius);
         }
 
-        if (!enabled || !driving) {
+        if (!enabled || !driving || handBlocked) {
+            // In practice the right hand is already OFF the wheel when a weapon appears -- equipping
+            // means reaching to the holster and squeezing there, which is the opposite end of the
+            // gesture. This clears the grab anyway: a weapon equipped some other way (a script, the
+            // radial, a keyboard) must not leave the hand welded to the wheel, and the blend below
+            // then walks the arm back over the usual ~0.1 s instead of snapping.
             w.engaged = false;
         } else if (w.engaged) {
             w.engaged = grip;                       // the grip alone holds it; let go and it ends
         } else if (grip && !w.gripPrev && w.atWheel) {
             w.engaged = true;                       // fresh press AT the wheel, never a held grip
         }
+        // Kept up to date even while blocked: a grip still held when the weapon is holstered is
+        // not a fresh press, so the wheel is not re-grabbed behind the player's back.
         w.gripPrev = grip;
 
         const float step = dtSec / (w.engaged ? kWheelEngageSec : kWheelReleaseSec);
@@ -2040,10 +2071,49 @@ static inline void VRIK_WheelUpdate(float dtSec) {
         g_vrikWheelSteerDeg = 0.0f;
     }
 
+    // HORN. Laying a hand on the middle of the wheel is the gesture everyone already knows, so a
+    // controller inside a small sphere at the (frozen) wheel centre holds the vehicle's horn
+    // button down. Measured against the same centre the one-handed steering uses -- the midpoint
+    // of the two ANIMATED hands, i.e. the hub -- so it needs no bone and no per-vehicle table.
+    //
+    // A hand that is GRABBING is excluded: with the grip held the arm is the animation's, the
+    // controller is free to wander, and working a wheel two-handed regularly takes a hand across
+    // where the hub is. Releasing the grip is what turns a hand at the hub back into a horn.
+    int hornMask = 0;
+    {
+        const bool hornEnabled = (VRIK_WheelSlot(vrshared::kWheelHornEnable) > 0.5f);
+        float hornR = VRIK_WheelSlot(vrshared::kWheelHornRadius);
+        if (!(hornR >= kWheelHornRadiusMin) || hornR > kWheelHornRadiusMax)
+            hornR = kWheelHornRadiusDefault;
+        const float rIn  = hornR;
+        const float rOut = hornR + kWheelHornHysteresis;
+
+        for (int h = 0; h < 2; ++h) {
+            VRIKWheelHand& w = g_vrikWheel[h];
+            bool at = false;
+            // The gun hand does not honk: with a weapon drawn the right hand is held out in front
+            // of the driver all the time, and the hub sphere sits exactly where it passes.
+            const bool hornBlocked = (h == 0) && weaponOut;
+            if (hornEnabled && driving && !hornBlocked
+                && g_vrikWheelCenterValid && w.targetValid && !w.engaged) {
+                const float dx = w.target[0] - g_vrikWheelCenter[0];
+                const float dy = w.target[1] - g_vrikWheelCenter[1];
+                const float dz = w.target[2] - g_vrikWheelCenter[2];
+                const float d2 = dx*dx + dy*dy + dz*dz;
+                const float r  = w.atHub ? rOut : rIn;
+                at = (d2 <= r * r);
+            }
+            w.atHub = at;
+            if (at) hornMask |= (h == 0) ? vrshared::kWheelArmedRightBit
+                                         : vrshared::kWheelArmedLeftBit;
+        }
+    }
+
     if (g_pSharedHands) {
         g_pSharedHands[vrshared::kWheelBlendRight] = g_vrikWheel[0].blend;
         g_pSharedHands[vrshared::kWheelBlendLeft]  = g_vrikWheel[1].blend;
         g_pSharedHands[vrshared::kWheelArmedMask]  = static_cast<float>(armedMask);
+        g_pSharedHands[vrshared::kWheelHornMask]   = static_cast<float>(hornMask);
         g_pSharedHands[vrshared::kWheelSteer]      = g_vrikWheelSteer;
         g_pSharedHands[vrshared::kWheelSteerDeg]   = g_vrikWheelSteerDeg;
     }
@@ -2111,6 +2181,13 @@ static inline void VRIK_WheelSteerUpdate(const float* bodyRight, const float* bo
             float maxDeg = VRIK_WheelSlot(vrshared::kWheelSteerMaxDeg);
             if (!(maxDeg >= 30.0f) || maxDeg > 120.0f) maxDeg = 90.0f;
 
+            // A slot that was never written reads 0, which is a legitimate "no deadzone" -- but so
+            // is a zeroed block, and the two are told apart the same way the radius is: only a
+            // value outside the settable range falls back to the default.
+            float deadDeg = VRIK_WheelSlot(vrshared::kWheelSteerDeadDeg);
+            if (!(deadDeg >= 0.0f) || deadDeg > kWheelSteerDeadDegMax) deadDeg = kWheelSteerDeadDegDefault;
+            if (deadDeg > maxDeg - 5.0f) deadDeg = maxDeg - 5.0f;   // never swallow the whole range
+
             deg = -std::atan2(y, hx) * 57.29577951f;
 
             // LEVER CORRECTION. Never more than 1: at the animation's own geometry the rule is
@@ -2124,7 +2201,7 @@ static inline void VRIK_WheelSteerUpdate(const float* bodyRight, const float* bo
                 if (lev > 1.0f) lev = 1.0f;
             }
 
-            float n = (std::fabs(deg) - kWheelSteerDeadDeg) / (maxDeg - kWheelSteerDeadDeg);
+            float n = (std::fabs(deg) - deadDeg) / (maxDeg - deadDeg);
             if (n < 0.0f) n = 0.0f;
             if (n > 1.0f) n = 1.0f;
             n *= lev;
@@ -2262,6 +2339,7 @@ static inline void VRIK_WheelReset() {
         g_vrikWheel[h].blend = 0.0f;
         g_vrikWheel[h].engaged = false;
         g_vrikWheel[h].atWheel = false;
+        g_vrikWheel[h].atHub = false;
         g_vrikWheel[h].gripPrev = false;
         g_vrikWheel[h].targetValid = false;
         g_vrikWheel[h].animValid = false;
@@ -2274,6 +2352,7 @@ static inline void VRIK_WheelReset() {
         g_pSharedHands[vrshared::kWheelBlendRight] = 0.0f;
         g_pSharedHands[vrshared::kWheelBlendLeft]  = 0.0f;
         g_pSharedHands[vrshared::kWheelArmedMask]  = 0.0f;
+        g_pSharedHands[vrshared::kWheelHornMask]   = 0.0f;   // or the horn sounds until the game exits
         g_pSharedHands[vrshared::kWheelSteer]      = 0.0f;
         g_pSharedHands[vrshared::kWheelSteerDeg]   = 0.0f;
     }

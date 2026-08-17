@@ -120,6 +120,11 @@ struct LiveControls {
     volatile int xrWheelGrab;       // 1 (default) = hand-to-wheel grab while driving: a grip squeezed with the hand on the animated wheel pose hands that arm back to the driving animation. Per hand. Published to shared[160].
     volatile float xrWheelRadius;   // how near the animated hand the controller must be for the grip to mean "grab", metres. Default 0.28. Published to shared[161].
     volatile float xrWheelSteerMaxDeg; // controller tilt that means full lock, degrees. 90 (default) = hands vertical. Lower turns less wrist into more steering. Published to shared[165].
+    volatile float xrWheelSteerDeadDeg; // steering deadzone around centre, degrees. 1.5 (default) = tremor only. Published to shared[166].
+    volatile int xrWheelHorn;       // 1 (default) = a hand laid on the wheel HUB sounds the horn (pad X = Vehicle_Horn). Published to shared[167].
+    volatile float xrWheelHornRadius; // how near the wheel centre the hand counts as "on the hub", metres. Default 0.12. Published to shared[168].
+    volatile int xrVehicleGunTrigger;  // 1 (default) = with a weapon out in the driver seat, the right trigger FIRES (pad RB) and the throttle is latched. Local to the XInput merge, no shared slot.
+    volatile float xrVehicleThrottleTrim; // how fast the left stick's Y trims the latched throttle, full range per second. Default 0.5.
 };
 
 static constexpr int kEnablePatchBufferTracer = 0;
@@ -182,6 +187,18 @@ void InitRuntimePaths() {
     g_liveControls.xrWheelRadius = 0.28f;
     // 90 deg = hands vertical is full lock, the 1:1 reading of a real wheel.
     g_liveControls.xrWheelSteerMaxDeg = 90.0f;
+    // 1.5 deg of deadzone: enough to swallow tremor, small enough that the wheel does not feel
+    // dead off centre. Every degree here is a degree the car ignores.
+    g_liveControls.xrWheelSteerDeadDeg = 1.5f;
+    // Horn ON: a hand on the middle of the wheel honks, as it would in a real car. 12 cm is the
+    // hub pad, comfortably inside the ~17 cm the animation holds the rim at.
+    g_liveControls.xrWheelHorn = 1;
+    g_liveControls.xrWheelHornRadius = 0.12f;
+    // Driving with a gun: trigger = fire, throttle latched. 0.5 per second on the trim means the
+    // stick takes two seconds held to walk the throttle from idle to floored -- fast enough to
+    // chase a target, slow enough that a thumb resting on the stick does not change your speed.
+    g_liveControls.xrVehicleGunTrigger = 1;
+    g_liveControls.xrVehicleThrottleTrim = 0.5f;
 
     // Default ON: VR controller -> XInput gamepad pipeline. Both the entry-point
     // detour (xrXInputInstall) and the gameplay action set (xrInputActions) are
@@ -491,6 +508,11 @@ static void PollLiveControls() {
     int xrWheelGrab = g_liveControls.xrWheelGrab;
     float xrWheelRadius = g_liveControls.xrWheelRadius > 0.0f ? g_liveControls.xrWheelRadius : 0.28f;
     float xrWheelSteerMaxDeg = g_liveControls.xrWheelSteerMaxDeg > 0.0f ? g_liveControls.xrWheelSteerMaxDeg : 90.0f;
+    float xrWheelSteerDeadDeg = g_liveControls.xrWheelSteerDeadDeg >= 0.0f ? g_liveControls.xrWheelSteerDeadDeg : 1.5f;
+    int xrWheelHorn = g_liveControls.xrWheelHorn;
+    float xrWheelHornRadius = g_liveControls.xrWheelHornRadius > 0.0f ? g_liveControls.xrWheelHornRadius : 0.12f;
+    int xrVehicleGunTrigger = g_liveControls.xrVehicleGunTrigger;
+    float xrVehicleThrottleTrim = g_liveControls.xrVehicleThrottleTrim > 0.0f ? g_liveControls.xrVehicleThrottleTrim : 0.5f;
 
     FILE* file = _fsopen(g_liveControlPath, "r", _SH_DENYNO);
     if (!file) return;
@@ -738,6 +760,31 @@ static void PollLiveControls() {
             xrWheelSteerMaxDeg = value;
             continue;
         }
+        if (sscanf_s(line, "xr_wheel_steer_dead_deg=%f", &value) == 1 ||
+            sscanf_s(line, "xr_wheel_steer_dead_deg = %f", &value) == 1) {
+            xrWheelSteerDeadDeg = value;
+            continue;
+        }
+        if (sscanf_s(line, "xr_wheel_horn=%d", &intValue) == 1 ||
+            sscanf_s(line, "xr_wheel_horn = %d", &intValue) == 1) {
+            xrWheelHorn = intValue;
+            continue;
+        }
+        if (sscanf_s(line, "xr_wheel_horn_radius=%f", &value) == 1 ||
+            sscanf_s(line, "xr_wheel_horn_radius = %f", &value) == 1) {
+            xrWheelHornRadius = value;
+            continue;
+        }
+        if (sscanf_s(line, "xr_vehicle_gun_trigger=%d", &intValue) == 1 ||
+            sscanf_s(line, "xr_vehicle_gun_trigger = %d", &intValue) == 1) {
+            xrVehicleGunTrigger = intValue;
+            continue;
+        }
+        if (sscanf_s(line, "xr_vehicle_throttle_trim=%f", &value) == 1 ||
+            sscanf_s(line, "xr_vehicle_throttle_trim = %f", &value) == 1) {
+            xrVehicleThrottleTrim = value;
+            continue;
+        }
 
     }
     fclose(file);
@@ -816,6 +863,18 @@ static void PollLiveControls() {
                                  : (xrWheelRadius > 0.60f ? 0.60f : xrWheelRadius);
     g_liveControls.xrWheelSteerMaxDeg = (xrWheelSteerMaxDeg < 30.0f) ? 30.0f
                                       : (xrWheelSteerMaxDeg > 120.0f ? 120.0f : xrWheelSteerMaxDeg);
+    // Deadzone capped well under the smallest full-lock angle (30 deg): a deadzone that met or
+    // passed it would leave no range at all between "dead" and "full lock".
+    g_liveControls.xrWheelSteerDeadDeg = (xrWheelSteerDeadDeg < 0.0f) ? 0.0f
+                                       : (xrWheelSteerDeadDeg > 20.0f ? 20.0f : xrWheelSteerDeadDeg);
+    g_liveControls.xrWheelHorn = xrWheelHorn != 0 ? 1 : 0;
+    // Below 4 cm the hub is unhittable with a hand you cannot see; above 30 cm it swallows the
+    // rim, and every reach for the wheel would honk.
+    g_liveControls.xrWheelHornRadius = (xrWheelHornRadius < 0.04f) ? 0.04f
+                                     : (xrWheelHornRadius > 0.30f ? 0.30f : xrWheelHornRadius);
+    g_liveControls.xrVehicleGunTrigger = xrVehicleGunTrigger != 0 ? 1 : 0;
+    g_liveControls.xrVehicleThrottleTrim = (xrVehicleThrottleTrim < 0.05f) ? 0.05f
+                                         : (xrVehicleThrottleTrim > 3.0f ? 3.0f : xrVehicleThrottleTrim);
     SetHmdTrackingSmooth(xrHmdSmooth);
     SetHandTrackingSmooth(xrHandSmooth);
     WriteVrikSettingsFile(); // keep the CET-facing bridge file in sync with vrport.ini
@@ -879,6 +938,11 @@ static LiveControlsUiState MakeLiveControlsUiState() {
     state.xrWheelGrab = g_liveControls.xrWheelGrab;
     state.xrWheelRadius = g_liveControls.xrWheelRadius;
     state.xrWheelSteerMaxDeg = g_liveControls.xrWheelSteerMaxDeg;
+    state.xrWheelSteerDeadDeg = g_liveControls.xrWheelSteerDeadDeg;
+    state.xrWheelHorn = g_liveControls.xrWheelHorn;
+    state.xrWheelHornRadius = g_liveControls.xrWheelHornRadius;
+    state.xrVehicleGunTrigger = g_liveControls.xrVehicleGunTrigger;
+    state.xrVehicleThrottleTrim = g_liveControls.xrVehicleThrottleTrim;
     // HUD placement isn't stored in g_liveControls; pull the last overlay-set
     // values (loaded from hud_layout.ini) into the contiguous xrHud* block.
     EnsureHudLoaded();
@@ -934,6 +998,11 @@ static void PersistLiveControlsUiState(const LiveControlsUiState& state) {
     fprintf(file, "xr_wheel_grab=%d\n", state.xrWheelGrab != 0 ? 1 : 0);
     fprintf(file, "xr_wheel_radius=%.3f\n", state.xrWheelRadius > 0.0f ? state.xrWheelRadius : 0.28f);
     fprintf(file, "xr_wheel_steer_max_deg=%.1f\n", state.xrWheelSteerMaxDeg > 0.0f ? state.xrWheelSteerMaxDeg : 90.0f);
+    fprintf(file, "xr_wheel_steer_dead_deg=%.1f\n", state.xrWheelSteerDeadDeg >= 0.0f ? state.xrWheelSteerDeadDeg : 1.5f);
+    fprintf(file, "xr_wheel_horn=%d\n", state.xrWheelHorn != 0 ? 1 : 0);
+    fprintf(file, "xr_wheel_horn_radius=%.3f\n", state.xrWheelHornRadius > 0.0f ? state.xrWheelHornRadius : 0.12f);
+    fprintf(file, "xr_vehicle_gun_trigger=%d\n", state.xrVehicleGunTrigger != 0 ? 1 : 0);
+    fprintf(file, "xr_vehicle_throttle_trim=%.2f\n", state.xrVehicleThrottleTrim > 0.0f ? state.xrVehicleThrottleTrim : 0.5f);
     fclose(file);
 
     WIN32_FILE_ATTRIBUTE_DATA fileData;
@@ -1004,7 +1073,15 @@ extern "C" void SetLiveControlsUiState(const LiveControlsUiState* state, int per
         g_liveControls.xrWheelRadius = (r < 0.08f) ? 0.08f : (r > 0.60f ? 0.60f : r);
         const float m = state->xrWheelSteerMaxDeg;
         g_liveControls.xrWheelSteerMaxDeg = (m < 30.0f) ? 30.0f : (m > 120.0f ? 120.0f : m);
+        const float d = state->xrWheelSteerDeadDeg;
+        g_liveControls.xrWheelSteerDeadDeg = (d < 0.0f) ? 0.0f : (d > 20.0f ? 20.0f : d);
+        const float hr = state->xrWheelHornRadius;
+        g_liveControls.xrWheelHornRadius = (hr < 0.04f) ? 0.04f : (hr > 0.30f ? 0.30f : hr);
+        const float tt = state->xrVehicleThrottleTrim;
+        g_liveControls.xrVehicleThrottleTrim = (tt < 0.05f) ? 0.05f : (tt > 3.0f ? 3.0f : tt);
     }
+    g_liveControls.xrWheelHorn = state->xrWheelHorn != 0 ? 1 : 0;
+    g_liveControls.xrVehicleGunTrigger = state->xrVehicleGunTrigger != 0 ? 1 : 0;
     WriteVrikSettingsFile(); // publish mouse-Y flag for the CET VRIK mod
 
     if (prevMono != g_liveControls.xrMonoSubmit) {
@@ -2930,6 +3007,10 @@ extern "C" void __fastcall OnLocateCameraCallback(float* rbxPtr, float xmm0_val)
                                                g_liveControls.xrWheelGrab != 0 ? 1.0f : 0.0f);
             OpenXRManager::Get().SetSharedSlot(vrshared::kWheelRadius, g_liveControls.xrWheelRadius);
             OpenXRManager::Get().SetSharedSlot(vrshared::kWheelSteerMaxDeg, g_liveControls.xrWheelSteerMaxDeg);
+            OpenXRManager::Get().SetSharedSlot(vrshared::kWheelSteerDeadDeg, g_liveControls.xrWheelSteerDeadDeg);
+            OpenXRManager::Get().SetSharedSlot(vrshared::kWheelHornEnable,
+                                               g_liveControls.xrWheelHorn != 0 ? 1.0f : 0.0f);
+            OpenXRManager::Get().SetSharedSlot(vrshared::kWheelHornRadius, g_liveControls.xrWheelHornRadius);
         }
     }
     
@@ -6870,13 +6951,85 @@ static DWORD WINAPI HookedXInputGetState(DWORD dwUserIndex, XINPUT_STATE* pState
         }
     }
 
+    // HORN. A hand laid on the middle of the wheel = pad X, which is what the game's own
+    // Vehicle_Horn mapping listens to (r6\config\inputUserMappings.xml: IK_Pad_X_SQUARE / IK_Z).
+    // Level-triggered, so the horn sounds for as long as the hand stays on the hub.
+    //
+    // Gated on g_isDriving here as well as in the hands plugin: the mask is only rewritten inside
+    // a fresh VRIK solve, and a mask left raised by a solve that stopped must not press X on foot,
+    // where the same button is a gameplay action.
+    if (g_isDriving && g_liveControls.xrWheelHorn != 0) {
+        if (float* sh = GetShotShared()) {
+            if (static_cast<int>(sh[vrshared::kWheelHornMask]) != 0) {
+                pState->Gamepad.wButtons |= 0x4000; // XINPUT_GAMEPAD_X
+            }
+        }
+    }
+
+    // DRIVING WITH A GUN OUT. Vanilla puts the throttle and the trigger finger on the same hand:
+    // the throttle is RT (Acceleration_Axis) and firing your own weapon from the driver seat is
+    // RB (VehicleDriverCombatRangedAttack_Button) -- both from the game's own
+    // r6\config\inputUserMappings.xml. That split works with a thumb and a finger on one pad; it
+    // does not work when the right hand is holding the gun and the left is on the wheel.
+    //
+    // So while a weapon is equipped in the driver seat:
+    //   * the right trigger becomes FIRE (pressed through as RB),
+    //   * the throttle is LATCHED at whatever it was the instant the weapon came out, so the car
+    //     keeps rolling with nothing holding RT,
+    //   * the left stick's Y TRIMS that latched throttle (forward = more, back = less).
+    // Holstering ends all three and the trigger is the throttle again, no state left behind.
+    //
+    // The trim axis is CONSUMED (zeroed, and the sprint gesture on it suppressed): in a vehicle
+    // stick Y is lean/rock and its CLICK is Vehicle_Autodrive, which our full-forward gesture
+    // asserts as L3 -- a throttle trim that handed the car to the autopilot at the top of its
+    // travel would be worse than no trim at all. Stick X is untouched, so stick steering still
+    // works for anyone not holding the wheel.
+    bool vehGunMode = false;
+    {
+        static bool  s_vehGunPrev = false;
+        static float s_vehThrottle = 0.0f;
+        static LARGE_INTEGER s_vehGunQpc = {};
+
+        vehGunMode = (g_isDriving && g_hasWeaponEquipped && g_liveControls.xrVehicleGunTrigger != 0);
+        if (vehGunMode) {
+            LARGE_INTEGER now, freq;
+            QueryPerformanceCounter(&now);
+            QueryPerformanceFrequency(&freq);
+            float dt = 0.0f;
+            if (s_vehGunPrev && s_vehGunQpc.QuadPart != 0 && freq.QuadPart > 0) {
+                dt = static_cast<float>(static_cast<double>(now.QuadPart - s_vehGunQpc.QuadPart)
+                                        / static_cast<double>(freq.QuadPart));
+            }
+            if (dt < 0.0f) dt = 0.0f;
+            if (dt > 0.10f) dt = 0.10f;   // a hitch must not slam the throttle
+            s_vehGunQpc = now;
+
+            // Freeze on the way in: whatever the trigger (ours or a physical pad's) was asking for
+            // on the last frame before the weapon appeared is the speed the car holds.
+            if (!s_vehGunPrev) s_vehThrottle = pState->Gamepad.bRightTrigger / 255.0f;
+
+            const float trimRate = g_liveControls.xrVehicleThrottleTrim > 0.0f
+                                 ? g_liveControls.xrVehicleThrottleTrim : 0.5f;
+            s_vehThrottle += ly * trimRate * dt;
+            if (s_vehThrottle < 0.0f) s_vehThrottle = 0.0f;
+            if (s_vehThrottle > 1.0f) s_vehThrottle = 1.0f;
+
+            // Assignment, not max(): the trigger is the gun's now, and the value it reports must
+            // not leak back into the throttle it no longer drives.
+            pState->Gamepad.bRightTrigger = static_cast<BYTE>(s_vehThrottle * 255.0f + 0.5f);
+            pState->Gamepad.sThumbLY = 0;                                  // consumed by the trim
+            if (vr.rightTrigger > 0.5f) pState->Gamepad.wButtons |= 0x0200; // RB = ranged attack
+        }
+        s_vehGunPrev = vehGunMode;
+    }
+
     // Left stick pushed near FULL forward => SPRINT. A partial push is left as the
     // game's normal jog; only "to the stop" sprints. CP2077 sprint is the left-stick
     // click (L3), so we just assert L3 while the stick is forward past the threshold
     // -- no more clicking the stick. Level-triggered (held while past the threshold)
     // mirrors physically holding L3: correct for hold-to-sprint, and toggle-sprint
     // auto-cancels on slow-down so it stays in sync as well.
-    const bool wantSprint = (ly > 0.90f);
+    const bool wantSprint = (ly > 0.90f) && !vehGunMode;
     // Published for the snap-event machinery: DURING SPRINT the game RATE-LIMITS heading
     // changes (sprint turns arc over several frames instead of jumping), so the instant
     // packet pre-rotation must be suppressed there (OnFootDeltaHeadCallback).
@@ -6938,12 +7091,17 @@ static DWORD WINAPI HookedXInputGetState(DWORD dwUserIndex, XINPUT_STATE* pState
     static uint16_t s_lastButtons = 0;
     static uint16_t s_lastSynth = 0;
     static BYTE s_lastLT = 0, s_lastRT = 0;
-    if (vr.buttons != s_lastButtons || synthButtons != s_lastSynth || lt != s_lastLT || rt != s_lastRT) {
+    // The trigger bytes compared here are the MERGED ones, not the raw VR values: the latched
+    // vehicle throttle walks bRightTrigger up and down while the VR trigger sits still, and a
+    // consumer that only re-reads on a new packet number would never see the trim move.
+    const BYTE outLT = pState->Gamepad.bLeftTrigger;
+    const BYTE outRT = pState->Gamepad.bRightTrigger;
+    if (vr.buttons != s_lastButtons || synthButtons != s_lastSynth || outLT != s_lastLT || outRT != s_lastRT) {
         pState->dwPacketNumber++;
         s_lastButtons = vr.buttons;
         s_lastSynth = synthButtons;
-        s_lastLT = lt;
-        s_lastRT = rt;
+        s_lastLT = outLT;
+        s_lastRT = outRT;
     }
     return r;
 }
