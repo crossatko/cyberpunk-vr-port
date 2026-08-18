@@ -27,18 +27,24 @@ jobs:
           submodules: recursive
 
       - name: Install toolchain
-        # llvm supplies clang-cl, llvm-rc, llvm-mt and llvm-lib; lld supplies lld-link. Ubuntu
-        # installs them only under /usr/lib/llvm-<ver>/bin -- there are no unversioned symlinks
-        # for clang-cl or lld-link -- so that directory goes on PATH, where the toolchain file
-        # and CMake both expect to find them.
+        # Clang 19 or newer, from apt.llvm.org rather than the distro. Ubuntu 24.04 ships Clang 18
+        # and the MSVC STL that xwin splats refuses it outright:
+        #   yvals_core.h: error STL1000: Unexpected compiler version, expected Clang 19.0.0 or newer
+        #
+        # These binaries live only under /usr/lib/llvm-<ver>/bin -- there are no unversioned
+        # clang-cl or lld-link symlinks -- so that directory goes on PATH, where CMake and the
+        # toolchain file both expect to find them.
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y clang lld llvm cmake ninja-build
-          LLVM_BIN=$(dirname "$(readlink -f "$(command -v clang)")")
-          echo "$LLVM_BIN" >> "$GITHUB_PATH"
-          echo "using $LLVM_BIN"
-          ls "$LLVM_BIN" | grep -E '^(clang-cl|lld-link|llvm-rc|llvm-mt|llvm-lib)$'
+          sudo apt-get install -y cmake ninja-build wget gnupg lsb-release software-properties-common
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 19
+          sudo apt-get install -y clang-19 lld-19 llvm-19
+          echo "/usr/lib/llvm-19/bin" >> "$GITHUB_PATH"
+          /usr/lib/llvm-19/bin/clang-cl --version
+          ls /usr/lib/llvm-19/bin | grep -E '^(clang-cl|lld-link|llvm-rc|llvm-mt|llvm-lib)$'
 
       - name: Cache Windows SDK
         id: cache-winsdk

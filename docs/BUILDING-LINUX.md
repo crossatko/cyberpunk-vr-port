@@ -11,6 +11,22 @@ The game itself runs under Proton, so the whole edit/build/test loop stays on Li
 
     clang lld llvm cmake ninja python3        # llvm provides llvm-rc / llvm-lib / llvm-mt
 
+**Clang 19 or newer.** The MSVC standard library shipped with the current Windows SDK refuses
+anything older, and says so rather than failing obscurely:
+
+    yvals_core.h: error STL1000: Unexpected compiler version, expected Clang 19.0.0 or newer
+
+Rolling distributions are already past that. Ubuntu 24.04 ships Clang 18, so install a newer one
+from [apt.llvm.org](https://apt.llvm.org):
+
+    wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s 19
+    sudo apt-get install -y clang-19 lld-19 llvm-19
+    export PATH=/usr/lib/llvm-19/bin:$PATH
+
+Debian and Ubuntu install these under `/usr/lib/llvm-<ver>/bin` and create no unversioned
+`clang-cl` or `lld-link` symlinks, so that directory has to be on `PATH` for CMake to find the
+compiler the toolchain file names.
+
 Then fetch the Windows SDK and CRT with [`xwin`](https://github.com/Jake-Shadle/xwin):
 
     cargo install xwin
