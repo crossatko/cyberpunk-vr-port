@@ -1,0 +1,64 @@
+# Build the plugins on Windows and publish them as a GitHub Release.
+#
+# Triggered by pushing a tag (v*). Binaries are built here rather than uploaded from a
+# maintainer's machine, so what people download corresponds exactly to the tagged commit.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # required to create the release
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build Stereo
+        run: |
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release
+
+      - name: Build Hands
+        run: |
+          cmake -B build-hands -S src/red4ext_plugin -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-hands --config Release
+
+      - name: Stage the plugin layout
+        shell: pwsh
+        # Laid out the way it drops into the game folder, so installing is a copy rather than a
+        # hunt for which DLL belongs where.
+        run: |
+          $stereo = "dist/red4ext/plugins/CyberpunkVR_Stereo"
+          $hands  = "dist/red4ext/plugins/CyberpunkVR_Hands"
+          New-Item -ItemType Directory -Force -Path $stereo,$hands | Out-Null
+          Get-ChildItem -Path build       -Recurse -Filter CyberpunkVR_Stereo.dll |
+            Select-Object -First 1 | ForEach-Object { Copy-Item $_.FullName $stereo }
+          Get-ChildItem -Path build-hands -Recurse -Filter CyberpunkVR_Hands.dll  |
+            Select-Object -First 1 | ForEach-Object { Copy-Item $_.FullName $hands }
+          Get-ChildItem dist -Recurse -File | Format-Table FullName,Length
+          Compress-Archive -Path dist/red4ext -DestinationPath CyberpunkVRPort-plugins.zip -Force
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: CyberpunkVRPort-plugins.zip
+          generate_release_notes: true
+          body: |
+            Plugin builds from this fork, compiled by CI from the tagged commit.
+
+            **These are the two plugin DLLs only, not the whole mod.** Install
+            CyberpunkVRPort normally first, then unzip this over the game folder to
+            replace `red4ext/plugins/CyberpunkVR_Stereo` and
+            `red4ext/plugins/CyberpunkVR_Hands`. Everything else -- the CET mods, archives,
+            redscript and the launcher config -- comes from the upstream release.
+
+            Built for Cyberpunk 2077 2.31.
