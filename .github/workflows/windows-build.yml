@@ -1,0 +1,59 @@
+# Build both plugins on Windows with MSVC.
+#
+# WHY THIS EXISTS: the Linux/Proton fixes in this branch were developed with clang-cl
+# cross-compiling to the MSVC ABI, which is stricter about standard conformance than MSVC's
+# own permissive mode -- so it catches more, not less. "More" is not "everything" though, and
+# everyone else building this runs Windows. This settles it on every push instead of by
+# inference.
+name: Windows build
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # RED4ext.SDK and minhook are submodules and both plugins fail to configure without
+          # them. Recursive because the SDK carries vendored dependencies of its own.
+          submodules: recursive
+
+      - name: Configure Stereo (root project)
+        # The root project pulls OpenXR and Dear ImGui via FetchContent, so this step needs
+        # network access. Default generator on windows-latest is Visual Studio 2022.
+        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Stereo
+        run: cmake --build build --config Release
+
+      - name: Configure Hands (separate project)
+        # src/red4ext_plugin is its own CMake root: it add_subdirectory's the SDK and compiles
+        # MinHook from source, so it is configured independently of the one above.
+        run: cmake -B build-hands -S src/red4ext_plugin -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Hands
+        run: cmake --build build-hands --config Release
+
+      - name: Collect DLLs
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Get-ChildItem -Path build,build-hands -Recurse -Filter *.dll |
+            ForEach-Object { Copy-Item $_.FullName -Destination dist -Force }
+          Get-ChildItem dist | Format-Table Name,Length
+
+      - name: Upload DLLs
+        uses: actions/upload-artifact@v4
+        with:
+          name: cyberpunk-vr-port-windows
+          path: dist/
+          # Short retention: these are build checks, not releases.
+          retention-days: 14
+          if-no-files-found: error
