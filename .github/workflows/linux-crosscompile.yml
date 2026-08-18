@@ -1,0 +1,89 @@
+# Cross-compile both plugins on Linux with clang-cl.
+#
+# The output is the same MSVC-ABI DLL the Windows job produces -- this proves the tree builds
+# with a second toolchain, and that docs/BUILDING-LINUX.md still describes something that works.
+# clang-cl is stricter than MSVC about standard conformance, so this catches things the Windows
+# job does not.
+name: Linux cross-compile
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Where the toolchain file expects the splatted Windows SDK. It reads $ENV{HOME}/winsdk.
+  XWIN_DIR: /home/runner/winsdk
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
+        # llvm supplies clang-cl, llvm-rc, llvm-mt and llvm-lib; lld supplies lld-link.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm cmake ninja-build
+
+      - name: Cache Windows SDK
+        id: cache-winsdk
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.XWIN_DIR }}
+          # Bump the suffix to force a re-splat.
+          key: winsdk-${{ runner.os }}-v1
+
+      - name: Fetch Windows SDK with xwin
+        if: steps.cache-winsdk.outputs.cache-hit != 'true'
+        # Prebuilt release binary rather than `cargo install xwin`, which would build it from
+        # source on every cache miss. Version is resolved at run time so this does not rot.
+        run: |
+          set -euo pipefail
+          url=$(curl -sSL https://api.github.com/repos/Jake-Shadle/xwin/releases/latest \
+                | grep -o 'https://[^"]*x86_64-unknown-linux-musl.tar.gz' | head -1)
+          echo "xwin: $url"
+          curl -sSL "$url" | tar -xz -C /tmp
+          install -m755 /tmp/xwin-*-x86_64-unknown-linux-musl/xwin /usr/local/bin/xwin
+          xwin --accept-license splat --output "$XWIN_DIR"
+
+      - name: Apply RED4ext.SDK clang-cl fixups
+        # Case-sensitive-filesystem symlink, plus includes for headers holding Handle<T> on a
+        # forward-declared T. Idempotent, so a cached SDK is not a problem.
+        run: ./tools/linux/apply-sdk-clang-fixes.sh
+
+      - name: Configure and build Stereo
+        run: |
+          cmake -B build-stereo -S . -G Ninja \
+                -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/tools/linux/toolchain-clang-cl.cmake" \
+                -DCMAKE_BUILD_TYPE=Release
+          ninja -C build-stereo CyberpunkVR_Stereo.dll
+
+      - name: Configure and build Hands
+        run: |
+          cmake -B build-hands -S src/red4ext_plugin -G Ninja \
+                -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/tools/linux/toolchain-clang-cl.cmake" \
+                -DCMAKE_BUILD_TYPE=Release
+          ninja -C build-hands CyberpunkVR_Hands.dll
+
+      - name: Collect DLLs
+        run: |
+          mkdir -p dist
+          find build-stereo build-hands -name '*.dll' -exec cp {} dist/ \;
+          # PE32+ confirms these are real Windows binaries and not something host-shaped.
+          file dist/*.dll
+          ls -la dist
+
+      - name: Upload DLLs
+        uses: actions/upload-artifact@v4
+        with:
+          name: cyberpunk-vr-port-linux-crosscompiled
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error
