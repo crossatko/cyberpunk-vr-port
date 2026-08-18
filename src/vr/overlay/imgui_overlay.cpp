@@ -1641,10 +1641,11 @@ bool DrawLiveControls(LiveControlsUiState& state) {
             ImGui::BulletText("Left  thumb click - sprint (L3) | Right thumb click - crouch (R3)");
             ImGui::BulletText("Left  menu button - pause menu");
             ImGui::BulletText("DPAD - Emulation");
-            ImGui::BulletText("Right GRIP + RightThum UP | DPAD UP");
-            ImGui::BulletText("Right GRIP + RightThum DOWN | DPAD DOWN");
-            ImGui::BulletText("Right GRIP + RightThum LEFT | DPAD LEFT");
-            ImGui::BulletText("Right GRIP + RightThum RIGHT | DPAD RIGHT");
+            ImGui::BulletText("Hold LEFT stick click + RIGHT stick click | START (pause menu)");
+            ImGui::BulletText("Hold LEFT stick click + RightThumb UP | DPAD UP");
+            ImGui::BulletText("Hold LEFT stick click + RightThumb DOWN | DPAD DOWN");
+            ImGui::BulletText("Hold LEFT stick click + RightThumb LEFT | DPAD LEFT");
+            ImGui::BulletText("Hold LEFT stick click + RightThumb RIGHT | DPAD RIGHT");
 
             ImGui::TextWrapped("Buttons follow each runtime's interaction profile (Touch / Index / "
                                "Vive / WMR). Customize the actual key bindings in the game's "

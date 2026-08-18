@@ -859,7 +859,19 @@ DWORD OpenXRManager::FrameThreadMain() {
                         ctrl.rightGrip    = grip;
                         ctrl.rightThumbX  = sx;
                         ctrl.rightThumbY  = sy;
-                        if (sclick) ctrl.buttons |= XB_RIGHT_THUMB;
+                        // START chord: the left Menu button is bound to START but SteamVR
+                        // swallows it for its own dashboard (confirmed on Touch via Steam Link),
+                        // so the pause menu -- and inventory/map/journal behind it -- was
+                        // unreachable from the controllers. While the L3 D-Pad modifier is held,
+                        // a RIGHT stick click emits START instead of R3. R3 alone is unchanged.
+                        if (sclick) {
+                            if (leftStickClicked) {
+                                ctrl.buttons |= 0x0010;   // XINPUT_GAMEPAD_START
+                                dpadUsedThisFrame = true; // suppress the deferred L3 sprint click
+                            } else {
+                                ctrl.buttons |= XB_RIGHT_THUMB;
+                            }
+                        }
                         if (prim)   ctrl.buttons |= XB_A;
                         if (sec)    ctrl.buttons |= XB_B;
 
