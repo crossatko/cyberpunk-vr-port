@@ -1,13 +1,20 @@
-# Build the plugins on Windows and publish them as a GitHub Release.
+# Build the plugins on Windows and publish the COMPLETE mod package as a GitHub Release.
 #
-# Triggered by pushing a tag (v*). Binaries are built here rather than uploaded from a
-# maintainer's machine, so what people download corresponds exactly to the tagged commit.
+# Triggered by pushing a tag (v*). Packaging is done by the project's own scripts/build_dist.ps1
+# rather than a layout invented here, so a release matches what the maintainers hand testers:
+# both plugins, the sight shaders, CET mods, redscript, tweaks, archives, grip poses and the
+# README. Built in CI, so a download corresponds exactly to the tagged commit.
 name: Release
 
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version string for the package name'
+        required: false
+        default: '0.0.0-dev'
 
 permissions:
   contents: write   # required to create the release
@@ -22,43 +29,69 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Derive version from the tag
+        id: ver
+        shell: bash
+        # build_dist.ps1 names the package CyberpunkVRPort-<version>; strip the leading v.
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then v="${GITHUB_REF_NAME#v}"; else v="${{ inputs.version }}"; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "packaging version $v"
+
       - name: Build Stereo
+        # build_dist.ps1 looks for build\bin\red4ext\plugins\CyberpunkVR_Stereo\Release\, so the
+        # build directory and configuration below are what it expects, not arbitrary choices.
         run: |
           cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
           cmake --build build --config Release
 
       - name: Build Hands
+        # Likewise: the script expects src\red4ext_plugin\build\RelWithDebInfo\.
         run: |
-          cmake -B build-hands -S src/red4ext_plugin -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-hands --config Release
+          cmake -B src/red4ext_plugin/build -S src/red4ext_plugin
+          cmake --build src/red4ext_plugin/build --config RelWithDebInfo
 
-      - name: Stage the plugin layout
+      - name: Package with the project's own dist script
         shell: pwsh
-        # Laid out the way it drops into the game folder, so installing is a copy rather than a
-        # hunt for which DLL belongs where.
+        run: pwsh scripts/build_dist.ps1 -Version "${{ steps.ver.outputs.version }}" -Zip
+
+      - name: Show what is in the package
+        shell: pwsh
         run: |
-          $stereo = "dist/red4ext/plugins/CyberpunkVR_Stereo"
-          $hands  = "dist/red4ext/plugins/CyberpunkVR_Hands"
-          New-Item -ItemType Directory -Force -Path $stereo,$hands | Out-Null
-          Get-ChildItem -Path build       -Recurse -Filter CyberpunkVR_Stereo.dll |
-            Select-Object -First 1 | ForEach-Object { Copy-Item $_.FullName $stereo }
-          Get-ChildItem -Path build-hands -Recurse -Filter CyberpunkVR_Hands.dll  |
-            Select-Object -First 1 | ForEach-Object { Copy-Item $_.FullName $hands }
-          Get-ChildItem dist -Recurse -File | Format-Table FullName,Length
-          Compress-Archive -Path dist/red4ext -DestinationPath CyberpunkVRPort-plugins.zip -Force
+          $zip = "dist/CyberpunkVRPort-${{ steps.ver.outputs.version }}.zip"
+          if (-not (Test-Path $zip)) { throw "package not produced: $zip" }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $a = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip))
+          $a.Entries | Select-Object FullName,Length | Format-Table -AutoSize
+          "{0} entries, {1:N0} bytes" -f $a.Entries.Count, (Get-Item $zip).Length
+          $a.Dispose()
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: CyberpunkVRPort-plugins.zip
+          files: dist/CyberpunkVRPort-${{ steps.ver.outputs.version }}.zip
           generate_release_notes: true
           body: |
-            Plugin builds from this fork, compiled by CI from the tagged commit.
+            Complete CyberpunkVRPort package built by CI from the tagged commit, with the
+            Linux/Proton fixes in this fork. For Cyberpunk 2077 **2.31**.
 
-            **These are the two plugin DLLs only, not the whole mod.** Install
-            CyberpunkVRPort normally first, then unzip this over the game folder to
-            replace `red4ext/plugins/CyberpunkVR_Stereo` and
-            `red4ext/plugins/CyberpunkVR_Hands`. Everything else -- the CET mods, archives,
-            redscript and the launcher config -- comes from the upstream release.
+            ## Install
+            Unzip into your Cyberpunk 2077 folder (the one with `bin\x64\Cyberpunk2077.exe`).
+            The archive is already laid out for it.
 
-            Built for Cyberpunk 2077 2.31.
+            ## You still need the frameworks
+            Not redistributed here, install them first if you do not have them:
+            [RED4ext](https://github.com/WopsS/RED4ext),
+            [Cyber Engine Tweaks](https://github.com/maximegmd/CyberEngineTweaks),
+            [redscript](https://github.com/jac3km4/redscript),
+            [ArchiveXL](https://github.com/psiberx/cp2077-archive-xl),
+            [TweakXL](https://github.com/psiberx/cp2077-tweak-xl),
+            [Codeware](https://github.com/psiberx/cp2077-codeware).
+
+            ## Read INSTALL/README in the zip before first launch
+            On first start the mod **replaces** your `UserSettings.json` with the settings it was
+            tuned against, keeping a timestamped backup. Set `first_launch=1` in
+            `bin\x64\vrport.ini` beforehand to skip that.
+
+            Upstream project by [dariulone](https://github.com/dariulone/cyberpunk-vr-port),
+            this fork based on [iPowerTech](https://github.com/iPowerTech/cyberpunk-vr-port). MIT.
