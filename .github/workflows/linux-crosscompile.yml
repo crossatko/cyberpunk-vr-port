@@ -27,10 +27,18 @@ jobs:
           submodules: recursive
 
       - name: Install toolchain
-        # llvm supplies clang-cl, llvm-rc, llvm-mt and llvm-lib; lld supplies lld-link.
+        # llvm supplies clang-cl, llvm-rc, llvm-mt and llvm-lib; lld supplies lld-link. Ubuntu
+        # installs them only under /usr/lib/llvm-<ver>/bin -- there are no unversioned symlinks
+        # for clang-cl or lld-link -- so that directory goes on PATH, where the toolchain file
+        # and CMake both expect to find them.
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y clang lld llvm cmake ninja-build
+          LLVM_BIN=$(dirname "$(readlink -f "$(command -v clang)")")
+          echo "$LLVM_BIN" >> "$GITHUB_PATH"
+          echo "using $LLVM_BIN"
+          ls "$LLVM_BIN" | grep -E '^(clang-cl|lld-link|llvm-rc|llvm-mt|llvm-lib)$'
 
       - name: Cache Windows SDK
         id: cache-winsdk
