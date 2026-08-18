@@ -284,6 +284,19 @@ volatile float     g_VRWristL_I = -0.70710678f, g_VRWristL_J = 0.0f,        g_VR
 // Per-hand reach scale + position offset (calibrated: R slightly shorter avatar reach than L).
 // 1.0 = true 1:1 reach (no hardcoded per-hand reach fudge; calibration may still override).
 volatile float     g_VRScaleR = 1.0f, g_VRScaleL = 1.0f;
+// [PALM] Wrist->palm correction. OpenXR reports a GRIP pose centred in the palm; the solver drives
+// the WRIST joint, so using it directly puts the hand a palm's length forward of the controller.
+// The offset is taken from the rig (see VRIK_ApplyPalmOffset) rather than hardcoded.
+//
+// Distinct from g_VROffR*/g_VROffL* below, which offset the IK target in MODEL space and so cannot
+// follow hand rotation.
+int                g_VRRightPalmIdx = -1;   // RightInHandMiddle, metacarpal
+int                g_VRRightMcpIdx = -1;    // RightHandMiddle1, the knuckle (MCP joint)
+int                g_VRLeftMcpIdx  = -1;    // LeftHandMiddle1
+int                g_VRLeftPalmIdx  = -1;   // LeftInHandMiddle
+volatile float     g_VRPalmFrac = 0.6f;     // how far along wrist->knuckle the grip centre sits
+volatile int       g_VRPalmEnable = 1;
+
 volatile float     g_VROffRX = 0.0f, g_VROffRY = 0.0f, g_VROffRZ = 0.0f;
 volatile float     g_VROffLX = 0.0f, g_VROffLY = 0.0f, g_VROffLZ = 0.0f;
 // T-pose measured real arm length per hand (metres), shoulder->controller in the T-pose.
@@ -4549,6 +4562,12 @@ static int VRIK_DoArmPlayer() {
                     else if (leftLen != 0 && len < leftLen) { leftHand = static_cast<int>(i); leftLen = len; }
                 }
 
+                // [PALM] Metacarpal + knuckle, for the wrist->palm correction.
+                if (EqualsInsensitive(nm, "RightInHandMiddle")) g_VRRightPalmIdx = static_cast<int>(i);
+                if (EqualsInsensitive(nm, "RightHandMiddle1")) g_VRRightMcpIdx = static_cast<int>(i);
+                if (EqualsInsensitive(nm, "LeftHandMiddle1"))  g_VRLeftMcpIdx  = static_cast<int>(i);
+                if (EqualsInsensitive(nm, "LeftInHandMiddle"))  g_VRLeftPalmIdx  = static_cast<int>(i);
+
                 // Arm-chain joints for the full IK (exact names on the player rig).
                 if (EqualsInsensitive(nm, "RightArm"))     rightArm  = static_cast<int>(i);
                 if (EqualsInsensitive(nm, "RightForeArm")) rightFore = static_cast<int>(i);
@@ -4827,6 +4846,10 @@ static int VRIK_DoArmPlayer() {
                     out << "boneCount=" << boneCount
                         << " parentCount=" << pc
                         << " head=" << g_VRHeadBoneIdx
+                        << " rightMcp=" << g_VRRightMcpIdx
+                        << " leftMcp=" << g_VRLeftMcpIdx
+                        << " rightPalm=" << g_VRRightPalmIdx
+                        << " leftPalm=" << g_VRLeftPalmIdx
                         << " rightHand=" << g_VRRightBoneIdx
                         << " leftHand=" << g_VRLeftBoneIdx
                         << " rightArm=" << g_VRRightUpperArmIdx
@@ -5713,6 +5736,23 @@ void SetVRElbowSwing(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFram
 // hand: 0 = right, 1 = left, anything else = both. Lets the user dial in the palm/finger
 // alignment live from the CET console without a rebuild. Applied as handRot = mapQuat *
 // wristCorr in VRIK_BuildHandTarget. Calibrated defaults: R(0,-90,0), L(-180,-90,0).
+// SetVRPalmFrac(frac, enable): runtime tuning for the wrist->palm correction. frac is the fraction
+// of the measured wrist->knuckle vector to apply; 0, or enable=0, disables it.
+void SetVRPalmFrac(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    float frac = 0.6f;
+    int32_t enable = 1;
+    RED4ext::GetParameter(aFrame, &frac);
+    RED4ext::GetParameter(aFrame, &enable);
+    aFrame->code++;
+
+    if (frac < -1.0f) frac = -1.0f;
+    if (frac >  2.0f) frac =  2.0f;
+    g_VRPalmFrac = frac;
+    g_VRPalmEnable = enable ? 1 : 0;
+    if (aOut) *aOut = 1;
+}
+
 void SetVRHandOffset(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
     RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
     float pitch = 0.0f, yaw = 0.0f, roll = 0.0f;
@@ -7280,6 +7320,12 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterTypes() {
 
     auto f15oTP = RED4ext::CGlobalFunction::Create("SetVRSmokeThumbPressL", "SetVRSmokeThumbPressL", &SetVRSmokeThumbPressL);
     f15oTP->flags = flags; f15oTP->SetReturnType("Int32"); f15oTP->AddParam("Float", "amount"); rtti->RegisterFunction(f15oTP);
+
+    auto f15pf = RED4ext::CGlobalFunction::Create("SetVRPalmFrac", "SetVRPalmFrac", &SetVRPalmFrac);
+    f15pf->AddParam("Float", "frac");
+    f15pf->AddParam("Int32", "enable");
+    f15pf->SetReturnType("Int32");
+    rtti->RegisterFunction(f15pf);
 
     auto f15p = RED4ext::CGlobalFunction::Create("SetVRBindMode", "SetVRBindMode", &SetVRBindMode);
     f15p->flags = flags; f15p->SetReturnType("Int32"); f15p->AddParam("Int32", "mode"); rtti->RegisterFunction(f15p);
