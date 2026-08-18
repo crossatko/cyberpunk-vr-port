@@ -139,6 +139,12 @@ extern volatile float     g_VRShoulderLX, g_VRShoulderLY, g_VRShoulderLZ;
 extern volatile float     g_VRElbowPoleR, g_VRElbowPoleL;
 extern volatile float     g_VRElbowSwingR, g_VRElbowSwingL;
 extern volatile int       g_VRRightBoneIdx;      // default 24 (RightHand)
+extern int                g_VRRightPalmIdx;      // RightInHandMiddle (metacarpal), -1 if unresolved
+extern int                g_VRRightMcpIdx;       // RightHandMiddle1 (knuckle), -1 if unresolved
+extern int                g_VRLeftMcpIdx;        // LeftHandMiddle1
+extern int                g_VRLeftPalmIdx;       // LeftInHandMiddle
+extern volatile float     g_VRPalmFrac;          // fraction along wrist->knuckle for the grip centre
+extern volatile int       g_VRPalmEnable;
 extern volatile int       g_VRFppCamIdx[5];      // Torso_fppCamera_* chain (frozen every pass)
 extern volatile int       g_VRCamBoneFreeze;     // live toggle: SetVRCamBoneFreeze(0/1) from CET
 extern volatile int       g_VRRightUpLegIdx;     // right hip bone (RightUpLeg)
@@ -619,7 +625,8 @@ static inline void VRIK_QuatFromTo(const float* a, const float* b, float* o) {
 // is what stops the hand from swinging when the head turns.
 static inline void VRIK_WriteHand(uint8_t* boneBuf, int bIdx,
                                   const float* headPos, const float* headQuat, bool headOk,
-                                  const float* vrPos, const float* vrQuat, bool writeRot) {
+                                  const float* vrPos, const float* vrQuat, bool writeRot,
+                                  bool isLeft = false) {
     if (bIdx < 0) return;
 
     const float s = g_VRBindScale;
@@ -641,18 +648,88 @@ static inline void VRIK_WriteHand(uint8_t* boneBuf, int bIdx,
     }
     pos[0] += g_VRBindOffX; pos[1] += g_VRBindOffY; pos[2] += g_VRBindOffZ;
 
+    // Rotation is computed before the position write: the palm correction is a vector in the hand's
+    // frame and has to ride it. VR->game axis swap, same as the gizmo's mapLocalQuat: (i, -k, j, r).
+    float localQuat[4] = { vrQuat[0], -vrQuat[2], vrQuat[1], vrQuat[3] };
+    float rot[4];
+    if (g_VRUseHeadRelative && headOk) {
+        VRIK_QuatMul(headQuat, localQuat, rot);
+    } else {
+        rot[0] = localQuat[0]; rot[1] = localQuat[1]; rot[2] = localQuat[2]; rot[3] = localQuat[3];
+    }
+
+    // [PALM] Wrist->palm correction, as VRIK_ApplyPalmOffset does for the IK path. Metacarpal only
+    // here -- this path is a direct bone write, not a solve.
+    const int palmIdx = isLeft ? g_VRLeftPalmIdx : g_VRRightPalmIdx;
+    if (g_VRPalmEnable && palmIdx >= 0 && palmIdx < g_VRBoneCount) {
+        const float* mc = reinterpret_cast<const float*>(boneBuf + palmIdx * 48 + 0);
+        const float f = g_VRPalmFrac;
+        const float o[3] = { mc[0] * f, mc[1] * f, mc[2] * f };
+        float rotated[3];
+        VRIK_QuatRotateVec(rot, o, rotated);
+        pos[0] -= rotated[0]; pos[1] -= rotated[1]; pos[2] -= rotated[2];
+    }
+
     // Translation @ +0 (QsTransform), Rotation @ +16 -- see file header.
     float* t = reinterpret_cast<float*>(boneBuf + bIdx * 48 + 0);
     t[0] = pos[0]; t[1] = pos[1]; t[2] = pos[2];
 
     if (writeRot) {
-        // VR->game axis swap, same as the gizmo's mapLocalQuat: (i, -k, j, r).
-        float localQuat[4] = { vrQuat[0], -vrQuat[2], vrQuat[1], vrQuat[3] };
         float* r = reinterpret_cast<float*>(boneBuf + bIdx * 48 + 16);
-        if (g_VRUseHeadRelative && headOk) {
-            VRIK_QuatMul(headQuat, localQuat, r);
-        } else {
-            r[0] = localQuat[0]; r[1] = localQuat[1]; r[2] = localQuat[2]; r[3] = localQuat[3];
+        r[0] = rot[0]; r[1] = rot[1]; r[2] = rot[2]; r[3] = rot[3];
+    }
+}
+
+// [PALM] Move the IK target from the controller's grip pose to the wrist joint the solver drives.
+//
+// Bind mode 4 solves the arm to `target`, which is the controller position in model space. OpenXR
+// reports a GRIP pose centred in the palm, so using it directly puts the hand a palm's length
+// forward of where the controller is held.
+//
+// The offset is the rig's own wrist->knuckle vector: metacarpal translation plus knuckle
+// translation carried through the metacarpal's rotation. Both are parent-local, so the result is
+// already in the hand's frame; handRot takes it to model space. No-op when either bone is
+// unresolved.
+static inline void VRIK_ApplyPalmOffset(const uint8_t* boneBuf, bool isLeft,
+                                        const float* handRot, float* target) {
+    if (!g_VRPalmEnable || !boneBuf || !handRot || !target) return;
+    const int palmIdx = isLeft ? g_VRLeftPalmIdx : g_VRRightPalmIdx;
+    if (palmIdx < 0 || palmIdx >= g_VRBoneCount) return;
+
+    // Compose hand -> metacarpal -> knuckle. The metacarpal alone measures 0.02 m from the wrist
+    // on the player rig, far too short to use by itself. Parent-local transforms compose through
+    // the parent's rotation; they are not two independent vectors to add.
+    const float* mc = reinterpret_cast<const float*>(boneBuf + palmIdx * 48 + 0);
+    float v[3] = { mc[0], mc[1], mc[2] };
+
+    const int mcpIdx = isLeft ? g_VRLeftMcpIdx : g_VRRightMcpIdx;
+    if (mcpIdx >= 0 && mcpIdx < g_VRBoneCount) {
+        const float* mcq = reinterpret_cast<const float*>(boneBuf + palmIdx * 48 + 16);
+        const float* kt  = reinterpret_cast<const float*>(boneBuf + mcpIdx * 48 + 0);
+        float carried[3];
+        VRIK_QuatRotateVec(mcq, kt, carried);
+        v[0] += carried[0]; v[1] += carried[1]; v[2] += carried[2];
+    }
+
+    const float f = g_VRPalmFrac;
+    const float o[3] = { v[0] * f, v[1] * f, v[2] * f };
+    float rotated[3];
+    VRIK_QuatRotateVec(handRot, o, rotated);
+    target[0] -= rotated[0];
+    target[1] -= rotated[1];
+    target[2] -= rotated[2];
+
+    // |v| outside ~0.06-0.12 m means this buffer is not in metres and g_VRPalmFrac does not scale
+    // what it appears to.
+    static bool s_logged[2] = { false, false };
+    const int side = isLeft ? 1 : 0;
+    if (!s_logged[side]) {
+        s_logged[side] = true;
+        const float mag = std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+        if (FILE* pf = std::fopen("vrik_palm.txt", "a")) {
+            std::fprintf(pf, "%s wrist->knuckle=(%.4f,%.4f,%.4f) |v|=%.4f frac=%.2f applied=%.4f m\n",
+                         isLeft ? "left" : "right", v[0], v[1], v[2], mag, f, mag * f);
+            std::fclose(pf);
         }
     }
 }
@@ -3760,6 +3837,10 @@ extern "C" inline void* Hooked_AnimPoseApply(void* a1, void* a2, void* a3, unsig
                                     VRIK_QuatMul(hm, wristR, handRot); VRIK_QuatNorm(handRot);
                                 }
                             }
+                            // [PALM] Pull the target back so the palm, not the wrist, lands on
+                            // the controller.
+                            VRIK_ApplyPalmOffset(boneBuf, /*isLeft*/false, handRot, target);
+
                             // Capture the SOLVED wrist position (= controller in model space)
                             // for the holster-distance block below.
                             rhWristModel[0] = target[0];
@@ -4066,6 +4147,10 @@ extern "C" inline void* Hooked_AnimPoseApply(void* a1, void* a2, void* a3, unsig
                                     VRIK_QuatMul(hm, wristL, handRot); VRIK_QuatNorm(handRot);
                                 }
                             }
+                            // [PALM] As the right hand, before anything downstream treats
+                            // (target, handRot) as the hand's transform.
+                            VRIK_ApplyPalmOffset(boneBuf, /*isLeft*/true, handRot, target);
+
                             VRIK_WheelStoreTarget(1, target);
                             VRIK_WheelBlendTarget(1, target, handRot);
                             if (!wheelOffL) {
@@ -4268,7 +4353,7 @@ extern "C" inline void* Hooked_AnimPoseApply(void* a1, void* a2, void* a3, unsig
                         const float vrPos[3]  = { SharedPose(1), SharedPose(2), SharedPose(3) };
                         const float vrQuat[4] = { SharedPose(4), SharedPose(5), SharedPose(6), SharedPose(7) };
                         VRIK_WriteHand(boneBuf, g_VRLeftBoneIdx, headPos, headQuat, headOk,
-                                       vrPos, vrQuat, true);
+                                       vrPos, vrQuat, true, /*isLeft*/true);
                     }
                 }
             }
