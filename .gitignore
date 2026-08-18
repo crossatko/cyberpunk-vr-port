@@ -80,3 +80,6 @@ mods/cet/**/vrik_recenter.ini
 
 # Stereo-plugin build output
 /build-stereo/
+
+# Linux cross-compilation toolchain (tools/* is ignored above)
+!tools/linux/
