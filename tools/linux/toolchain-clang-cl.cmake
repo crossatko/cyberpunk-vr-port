@@ -1,6 +1,12 @@
 set(CMAKE_SYSTEM_NAME Windows)
 set(CMAKE_SYSTEM_PROCESSOR AMD64)
-set(XWIN "$ENV{HOME}/winsdk")
+# Splatted Windows SDK + CRT (see docs/BUILDING-LINUX.md). $XWIN overrides the default, which
+# matters anywhere HOME is not the developer's own -- CI containers set it to /github/home.
+if(DEFINED ENV{XWIN})
+  set(XWIN "$ENV{XWIN}")
+else()
+  set(XWIN "$ENV{HOME}/winsdk")
+endif()
 set(CMAKE_C_COMPILER   clang-cl)
 set(CMAKE_CXX_COMPILER clang-cl)
 set(CMAKE_LINKER       lld-link)

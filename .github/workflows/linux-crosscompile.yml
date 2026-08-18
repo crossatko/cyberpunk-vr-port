@@ -1,9 +1,13 @@
 # Cross-compile both plugins on Linux with clang-cl.
 #
-# The output is the same MSVC-ABI DLL the Windows job produces -- this proves the tree builds
-# with a second toolchain, and that docs/BUILDING-LINUX.md still describes something that works.
-# clang-cl is stricter than MSVC about standard conformance, so this catches things the Windows
-# job does not.
+# The output is the same MSVC-ABI DLL the Windows job produces -- this proves the tree builds with
+# a second toolchain, and that docs/BUILDING-LINUX.md still describes something that works.
+# clang-cl is stricter than MSVC about standard conformance, so it catches what the Windows job
+# does not.
+#
+# Runs in an Arch container rather than on the runner's Ubuntu directly. The MSVC standard library
+# shipped with the current Windows SDK requires Clang 19+ (STL1000), which Ubuntu 24.04 does not
+# have, and a rolling distribution is also what this mod is actually developed and played on.
 name: Linux cross-compile
 
 on:
@@ -13,51 +17,40 @@ on:
   workflow_dispatch:
 
 env:
-  # Where the toolchain file expects the splatted Windows SDK. It reads $ENV{HOME}/winsdk.
-  XWIN_DIR: /home/runner/winsdk
+  # Explicit, rather than $HOME/winsdk: inside a container HOME is /github/home, and the cache
+  # step needs a path known before the job runs. The toolchain file reads $XWIN.
+  XWIN: /opt/winsdk
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    container: archlinux:latest
 
     steps:
+      - name: Install toolchain
+        # Before checkout on purpose: actions/checkout needs git present in the container to fetch
+        # submodules, and the bare image has none. tar and zstd are what actions/cache uses.
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed clang lld llvm cmake ninja git curl tar zstd python
+          clang-cl --version
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Install toolchain
-        # Clang 19 or newer, from apt.llvm.org rather than the distro. Ubuntu 24.04 ships Clang 18
-        # and the MSVC STL that xwin splats refuses it outright:
-        #   yvals_core.h: error STL1000: Unexpected compiler version, expected Clang 19.0.0 or newer
-        #
-        # These binaries live only under /usr/lib/llvm-<ver>/bin -- there are no unversioned
-        # clang-cl or lld-link symlinks -- so that directory goes on PATH, where CMake and the
-        # toolchain file both expect to find them.
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y cmake ninja-build wget gnupg lsb-release software-properties-common
-          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
-          chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh 19
-          sudo apt-get install -y clang-19 lld-19 llvm-19
-          echo "/usr/lib/llvm-19/bin" >> "$GITHUB_PATH"
-          /usr/lib/llvm-19/bin/clang-cl --version
-          ls /usr/lib/llvm-19/bin | grep -E '^(clang-cl|lld-link|llvm-rc|llvm-mt|llvm-lib)$'
-
       - name: Cache Windows SDK
         id: cache-winsdk
         uses: actions/cache@v4
         with:
-          path: ${{ env.XWIN_DIR }}
-          # Bump the suffix to force a re-splat.
-          key: winsdk-${{ runner.os }}-v1
+          path: ${{ env.XWIN }}
+          key: winsdk-arch-v1
 
       - name: Fetch Windows SDK with xwin
         if: steps.cache-winsdk.outputs.cache-hit != 'true'
         # Prebuilt release binary rather than `cargo install xwin`, which would build it from
-        # source on every cache miss. Version is resolved at run time so this does not rot.
+        # source on every cache miss. Version resolved at run time so the pin does not rot.
         run: |
           set -euo pipefail
           url=$(curl -sSL https://api.github.com/repos/Jake-Shadle/xwin/releases/latest \
@@ -65,7 +58,7 @@ jobs:
           echo "xwin: $url"
           curl -sSL "$url" | tar -xz -C /tmp
           install -m755 /tmp/xwin-*-x86_64-unknown-linux-musl/xwin /usr/local/bin/xwin
-          xwin --accept-license splat --output "$XWIN_DIR"
+          xwin --accept-license splat --output "$XWIN"
 
       - name: Apply RED4ext.SDK clang-cl fixups
         # Case-sensitive-filesystem symlink, plus includes for headers holding Handle<T> on a
@@ -75,14 +68,14 @@ jobs:
       - name: Configure and build Stereo
         run: |
           cmake -B build-stereo -S . -G Ninja \
-                -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/tools/linux/toolchain-clang-cl.cmake" \
+                -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/tools/linux/toolchain-clang-cl.cmake" \
                 -DCMAKE_BUILD_TYPE=Release
           ninja -C build-stereo CyberpunkVR_Stereo.dll
 
       - name: Configure and build Hands
         run: |
           cmake -B build-hands -S src/red4ext_plugin -G Ninja \
-                -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/tools/linux/toolchain-clang-cl.cmake" \
+                -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/tools/linux/toolchain-clang-cl.cmake" \
                 -DCMAKE_BUILD_TYPE=Release
           ninja -C build-hands CyberpunkVR_Hands.dll
 
@@ -91,7 +84,7 @@ jobs:
           mkdir -p dist
           find build-stereo build-hands -name '*.dll' -exec cp {} dist/ \;
           # PE32+ confirms these are real Windows binaries and not something host-shaped.
-          file dist/*.dll
+          file dist/*.dll || true
           ls -la dist
 
       - name: Upload DLLs

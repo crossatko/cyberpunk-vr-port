@@ -16,24 +16,22 @@ anything older, and says so rather than failing obscurely:
 
     yvals_core.h: error STL1000: Unexpected compiler version, expected Clang 19.0.0 or newer
 
-Rolling distributions are already past that. Ubuntu 24.04 ships Clang 18, so install a newer one
-from [apt.llvm.org](https://apt.llvm.org):
+Rolling distributions (Arch, Fedora, openSUSE Tumbleweed) are already past that. Debian and
+Ubuntu are not: 24.04 ships Clang 18, and installs `clang-cl` and `lld-link` only under
+`/usr/lib/llvm-<ver>/bin` with no unversioned symlinks, so a newer toolchain has to come from
+[apt.llvm.org](https://apt.llvm.org) and that directory has to be on `PATH`.
 
-    wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s 19
-    sudo apt-get install -y clang-19 lld-19 llvm-19
-    export PATH=/usr/lib/llvm-19/bin:$PATH
-
-Debian and Ubuntu install these under `/usr/lib/llvm-<ver>/bin` and create no unversioned
-`clang-cl` or `lld-link` symlinks, so that directory has to be on `PATH` for CMake to find the
-compiler the toolchain file names.
+CI cross-compiles in an `archlinux:latest` container for the same reason.
 
 Then fetch the Windows SDK and CRT with [`xwin`](https://github.com/Jake-Shadle/xwin):
 
     cargo install xwin
     xwin --accept-license splat --output ~/winsdk
 
-`~/winsdk` is where the toolchain file expects them (~640 MB). Set `XWIN` in
-`tools/linux/toolchain-clang-cl.cmake` if you put them elsewhere.
+`~/winsdk` is where the toolchain file looks by default (~640 MB). Set the `XWIN` environment
+variable to override it:
+
+    export XWIN=/opt/winsdk
 
 ## One-time SDK fixups
 
