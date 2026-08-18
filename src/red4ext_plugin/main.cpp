@@ -56,6 +56,26 @@
 
 #include "vrik_hook.h"
 #include "weapon_aim_hook.h"
+#include <cstdio>
+#include <cstdarg>
+
+// Diagnostic log for this investigation: append + flush so a hard crash still leaves it.
+static void VRIK_BC_FMT(const char* fmt, ...)
+{
+    // Diagnostics silenced for normal play. Flip VRIK_LOG_ENABLED to 1 to re-enable.
+#if defined(VRIK_LOG_ENABLED) && VRIK_LOG_ENABLED
+    FILE* f = nullptr;
+    if (fopen_s(&f, "vrik_lookup.txt", "a") != 0 || !f) return;
+    va_list ap; va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f); fflush(f); fclose(f);
+#else
+    (void)fmt;
+#endif
+}
+
+
 
 // ---- Weapon-aim native hook state (ShotInputClassify redirect) ----
 volatile uint64_t  g_shotTick = 0;
@@ -909,26 +929,132 @@ static RED4ext::world::AnimationSystem* FindWorldAnimationSystemFromScene(RED4ex
     if (aOut)
         *aOut << "GetWorldAnimationSystem() returned null, scanning runtime scene memory...\n";
 
-    if (auto* sys = ScanForAnimationSystemInBlock(reinterpret_cast<uint8_t*>(aRuntimeScene), 0x4B8, aOut))
-    {
-        g_cachedAnimationSystem = sys;
-        return sys;
-    }
+    // heap scan DISABLED: virtual call through unvalidated pointers, unguardable
 
     if (aFrameworkScene)
     {
-        if (auto* sys = ScanForAnimationSystemInBlock(reinterpret_cast<uint8_t*>(aFrameworkScene), 0x800, aOut))
-        {
-            g_cachedAnimationSystem = sys;
-            return sys;
-        }
+    // heap scan DISABLED: virtual call through unvalidated pointers, unguardable
     }
 
     return nullptr;
 }
 
+// ============================================================================
+// Component-based AnimatedObject lookup (bypasses worldAnimationSystem entirely).
+//
+// The original path needs the world animation system purely to map player-entity ->
+// AnimatedObject via its entity buckets. On 2.31 that system cannot be located: it is a
+// WORLD system (not a gameInstance one, so GetSystem returns null), worldRuntimeScene
+// exposes no RTTI properties to read an offset from, and the fallback heap scan makes a
+// virtual call through unvalidated pointers -- which crashes and cannot be guarded,
+// because a bad vtable executes memory rather than faulting.
+//
+// The modding wiki notes the entAnimatedComponent named "root" is the base for all
+// animation and lives in the entity's own components array. ent::Entity maps it at 0xA0.
+// So: walk the player's components, find "root", then scan that ONE component (0x2B0
+// bytes) for a pointer that structurally looks like an AnimatedObject. AnimatedObject has
+// no vtable (first field is metaRigID), so it is identified by shape alone -- no virtual
+// dispatch anywhere, which is what made the old scan unsafe.
+// ============================================================================
+static bool VRIK_Readable(const void* p, size_t n)
+{
+    const uintptr_t v = reinterpret_cast<uintptr_t>(p);
+    if (v < 0x10000ull || v >= 0x7FFFFFFFFFFFull) return false;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+    const uintptr_t end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+    return (v + n) <= end;
+}
+
+// AnimatedObject: metaRigID @0x00, MetaRig* @0x08. MetaRig::boneNames is a DynArray at
+// +0x20 (entries @0x00, capacity @0x08, size @0x0C). A player rig has a few hundred bones.
+static bool VRIK_LooksLikeAnimatedObject(void* aCandidate, uint32_t* aBoneCountOut)
+{
+    if (!VRIK_Readable(aCandidate, 0x100)) return false;
+    auto* base = reinterpret_cast<uint8_t*>(aCandidate);
+
+    void* metaRig = nullptr;
+    __try { metaRig = *reinterpret_cast<void**>(base + 0x08); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    if (!VRIK_Readable(metaRig, 0x70)) return false;
+
+    uint32_t boneCount = 0, boneCap = 0;
+    void* boneEntries = nullptr;
+    __try
+    {
+        auto* mr = reinterpret_cast<uint8_t*>(metaRig);
+        boneEntries = *reinterpret_cast<void**>(mr + 0x20 + 0x00);
+        boneCap     = *reinterpret_cast<uint32_t*>(mr + 0x20 + 0x08);
+        boneCount   = *reinterpret_cast<uint32_t*>(mr + 0x20 + 0x0C);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+
+    if (boneCount < 16 || boneCount > 4096) return false;   // player rig is a few hundred
+    if (boneCap < boneCount) return false;
+    if (!VRIK_Readable(boneEntries, static_cast<size_t>(boneCount) * sizeof(uint64_t))) return false;
+
+    if (aBoneCountOut) *aBoneCountOut = boneCount;
+    return true;
+}
+
+static RED4ext::anim::AnimatedObject* FindPlayerAnimatedObjectViaComponents(const char* aComponentName)
+{
+    auto* playerEntity = FindPlayerEntity();
+    if (!playerEntity || !aComponentName) return nullptr;
+    if (!VRIK_Readable(playerEntity, 0xB8)) return nullptr;
+
+    const RED4ext::CName wanted(aComponentName);
+
+    // ent::Entity::components -- DynArray<Handle<IComponent>> at 0xA0
+    auto* comps = reinterpret_cast<RED4ext::DynArray<RED4ext::Handle<RED4ext::ent::IComponent>>*>(
+                      reinterpret_cast<uint8_t*>(playerEntity) + 0xA0);
+    uint32_t compCount = 0;
+    __try { compCount = comps->Size(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+    if (compCount == 0 || compCount > 4096) return nullptr;
+
+    for (uint32_t i = 0; i < compCount; ++i)
+    {
+        RED4ext::ent::IComponent* comp = nullptr;
+        __try { comp = (*comps)[i].instance; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+        if (!VRIK_Readable(comp, 0x2B0)) continue;
+
+        RED4ext::CName nm;
+        __try { nm = comp->name; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+        if (nm != wanted) continue;
+
+        // Found the "root" component. Its AnimatedObject pointer sits in one of the
+        // SDK's unmapped gaps, so identify it by shape within this one object.
+        auto* cbase = reinterpret_cast<uint8_t*>(comp);
+        for (size_t off = 0x08; off + 8 <= 0x2B0; off += 8)
+        {
+            void* cand = nullptr;
+            __try { cand = *reinterpret_cast<void**>(cbase + off); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+            uint32_t bones = 0;
+            if (VRIK_LooksLikeAnimatedObject(cand, &bones))
+            {
+                VRIK_BC_FMT("VC hit: component=root offset=0x%zX bones=%u", off, bones);
+                return reinterpret_cast<RED4ext::anim::AnimatedObject*>(cand);
+            }
+        }
+        VRIK_BC_FMT("VC miss: root component scanned, no AnimatedObject shape found");
+        return nullptr;
+    }
+    VRIK_BC_FMT("VC miss: no component named %s among %u", aComponentName, compCount);
+    return nullptr;
+}
+
 static RED4ext::anim::AnimatedObject* FindPlayerAnimatedObjectByComponentName(const char* aComponentName)
 {
+    // NEW primary path: reach the AnimatedObject through the entity's own components.
+    if (auto* viaComp = FindPlayerAnimatedObjectViaComponents(aComponentName))
+        return viaComp;
+
     auto* playerEntity = FindPlayerEntity();
     auto* engine = RED4ext::CGameEngine::Get();
     auto* framework = engine ? engine->framework : nullptr;
@@ -4508,7 +4634,15 @@ static int VRIK_DoArmPlayer() {
     // match, fall back to the shortest name containing the needles (so we get the
     // hand root, not a finger like "RightHandThumb1").
     auto* metaRig = animObj->metaRig;
-    if (metaRig && std::strcmp(ClassifyQword(reinterpret_cast<uint64_t>(metaRig)), "HEAP") == 0)
+    // ClassifyQword only accepts 0x10000000000..0x700000000000 as "HEAP". The metaRig we
+    // reach via the component path is valid and readable (683 bones read through it) but
+    // falls outside that arbitrary window, so this gate silently skipped ALL bone-name
+    // resolution -- leaving every bone index unset, which is why the left hand had no
+    // index and the arm chain never resolved. Use a real readability probe instead.
+    VRIK_BC_FMT("METARIG ptr=%p classify=%s readable=%d", (void*)metaRig,
+                metaRig ? ClassifyQword(reinterpret_cast<uint64_t>(metaRig)) : "<null>",
+                metaRig ? (int)VRIK_Readable(metaRig, 0x70) : 0);
+    if (metaRig && VRIK_Readable(metaRig, 0x70))
     {
         const uint32_t boneCount = metaRig->boneNames.Size();
         if (boneCount > 0 && boneCount < 8192)
@@ -4531,6 +4665,11 @@ static int VRIK_DoArmPlayer() {
                 const char* nm = metaRig->boneNames[i].ToString();
                 if (!nm || !nm[0])
                     continue;
+                {   // one-shot dump of every bone name, so we can see 2.31's actual convention
+                    static bool s_dumped = false;
+                    if (!s_dumped && i + 1 == boneCount) s_dumped = true;
+                    if (!s_dumped) VRIK_BC_FMT("BONE[%u]=%s", i, nm);
+                }
                 const size_t len = std::strlen(nm);
 
                 if (EqualsInsensitive(nm, "Head")) { head = static_cast<int>(i); headLen = 0; }
@@ -4625,6 +4764,8 @@ static int VRIK_DoArmPlayer() {
                 if (EqualsInsensitive(nm, "WeaponLeft")) smokeLighterTmp = static_cast<int>(i);
             }
 
+            VRIK_BC_FMT("BONES bones=%u head=%d rHand=%d lHand=%d rArm=%d rFore=%d lArm=%d lFore=%d spines=%d",
+                        boneCount, head, rightHand, leftHand, rightArm, rightFore, leftArm, leftFore, spineTmpCount);
             if (head >= 0)      g_VRHeadBoneIdx  = head;
             if (rightHand >= 0) g_VRRightBoneIdx = rightHand;
             if (leftHand >= 0)  g_VRLeftBoneIdx  = leftHand;
